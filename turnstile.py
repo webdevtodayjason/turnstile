@@ -222,11 +222,14 @@ class Budget:
     def note(self, model_id, units, owner):
         """Record that `owner` wants `model_id` resident. Advisory, for humans."""
         try:
-            book = json.load(open(self.path))
+            with open(self.path) as fh:
+                book = json.load(fh)
         except Exception:
             book = {}
         book[str(model_id)] = {"units": int(units), "owner": str(owner), "ts": time.time()}
-        tmp = self.path + ".tmp"
+        # Unique temp name: two processes noting at once would otherwise write the same
+        # file and one would rename a half-written copy over the other's.
+        tmp = "%s.%d.tmp" % (self.path, os.getpid())
         with open(tmp, "w") as fh:
             json.dump(book, fh, indent=1)
         os.replace(tmp, self.path)
@@ -321,6 +324,11 @@ class Turnstile:
                     out = self._request(path, body, method, timeout=timeout, raw=raw)
                     why = self._busy_reason(out)
                     if why is None:
+                        if raw and not isinstance(out, (bytes, bytearray)):
+                            # We promised bytes and got a JSON object that is not a busy
+                            # signal, so it is the device declining. Say so rather than
+                            # handing back a dict where a caller expects a PNG.
+                            raise DeviceError("device declined: %s" % str(out)[:200])
                         return out
                     last = why
                 except urllib.error.HTTPError as exc:

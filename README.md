@@ -150,6 +150,17 @@ Peak concurrency at the device was 1. The suite also covers the retry path, givi
 honestly instead of hanging forever, `hold()` excluding an outsider, budget accounting,
 and the one that matters most: **`kill -9` on the holder frees the device immediately.**
 
+To validate against a real device, on the machine that can reach it:
+
+```bash
+sudo ./verify-on-device.sh
+```
+
+It reads the device key from `/etc/warboard.env` into its own environment, never prints
+it, lists residency, makes one real inference, and then runs two concurrent processes
+while whatever else you have running keeps using the device — real contention from a
+workload that has never heard of the lock, which is the evidence that counts.
+
 > **Status: validated against the fake device, not yet against hardware.** The contention
 > contract the fake enforces, and the device behaviours documented above (`150004`,
 > the ~12s 502 window after `/start`, the `reasoning_content` budget quirk, 512×512-only

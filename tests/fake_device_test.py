@@ -23,7 +23,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from turnstile import Turnstile, DeviceBusy, _CrossProcessLock  # noqa: E402
+from turnstile import Turnstile, DeviceBusy, DeviceError, _CrossProcessLock  # noqa: E402
 
 HOST, PORT = "127.0.0.1", 8899
 WORK_S = 0.12          # how long a fake inference "takes"
@@ -38,6 +38,7 @@ class Device:
         self.collisions = 0
         self.served = 0
         self.fail_next = 0        # force N busy replies, to exercise the retry path
+        self.decline_image = False
 
     def enter(self):
         with self.lock:
@@ -88,6 +89,17 @@ class Handler(BaseHTTPRequestHandler):
         self.rfile.read(n)
         if self.path.startswith("/api/v1/models/"):
             return self._send(200, {"ok": True})
+        if self.path == "/v1/image/generate":
+            # The real device answers with raw PNG bytes, or a JSON body when it
+            # declines. Both shapes have to reach the caller correctly.
+            if DEV.decline_image:
+                return self._send(200, {"code": 400, "message": "unsupported size"})
+            png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 64
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(png)))
+            self.end_headers()
+            return self.wfile.write(png)
         if not DEV.enter():
             # exactly what a real Tiiny says when it is already thinking
             return self._send(200, {"code": 150004,
@@ -305,6 +317,22 @@ def main():
     check("different ports on one device share a lock",
           Turnstile(host="172.17.7.177", port=9098, key="x")._lock is one._lock,
           "one NPU, so they must queue together")
+
+    # (e) Binary responses must survive as bytes, and a declined image must raise
+    #     rather than handing the caller a dict where a PNG was promised.
+    print("")
+    png = t.image("fake/img", "a lighthouse", seed=7)
+    check("image returns real bytes", isinstance(png, bytes) and png[:8] == b"\x89PNG\r\n\x1a\n",
+          "%d bytes" % len(png))
+    DEV.decline_image = True
+    try:
+        t.image("fake/img", "a lighthouse", seed=7)
+        check("declined image raises instead of returning a dict", False, "returned normally")
+    except DeviceError as exc:
+        check("declined image raises instead of returning a dict", True, str(exc)[:50])
+    except Exception as exc:
+        check("declined image raises instead of returning a dict", False, type(exc).__name__)
+    DEV.decline_image = False
 
     srv.shutdown()
     print("\n%s  (%d checks failed)" % ("ALL PASS" if not failures else "FAILURES: " + ", ".join(failures),
