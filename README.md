@@ -115,11 +115,25 @@ with t.borrowed("Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", units=7):
 |---|---|---|
 | `TIINY_HOST` | `127.0.0.1` | device address |
 | `TIINY_KEY` | — | device API key |
-| `TURNSTILE_DIR` | system temp | where the lock file lives |
+| `TURNSTILE_DIR` | `/tmp` | where the lock file lives |
 
-Set `TURNSTILE_DIR` to a path both applications can see if they run in containers or under
-different users — two processes only coordinate if they lock the *same file*. The lock is
-per-device, so two Tiinys never block each other.
+Two processes only coordinate if they lock the **same file**, so the default is `/tmp` and
+the lock file is created mode `0666`. Both of those are deliberate, and both were bugs
+first:
+
+* `tempfile.gettempdir()` looks like the obvious default and is wrong. On macOS it is
+  per-user (`/var/folders/…`), so an app running as a service account and an app running
+  as you would take out two different lock files and coordinate with nobody — silently,
+  which is the worst way for a lock to fail.
+* The umask creates files `0644`, so the second user to arrive got `PermissionError`
+  instead of a lock.
+
+Running as one user on Linux, neither would ever have shown up. Set `TURNSTILE_DIR` to a
+shared path if your processes are in containers that do not share `/tmp`.
+
+The lock is per-device, so two Tiinys never block each other. The port is deliberately not
+part of the identity: one device exposes several ports that all contend for the same NPU,
+so they must share a lock.
 
 Constructor arguments cover the rest: `tries`, `base_delay`, `max_delay`, `timeout`, and
 `on_wait`, a callback so your UI can say "device busy" instead of going silent.
@@ -146,9 +160,11 @@ Measured on an Orange Pi 6 Plus (Ubuntu 26.04, Python 3.13), 4 processes × 6 ca
 | control, no coordination | 18 | 18 of 24 |
 | **through the turnstile** | **0** | **0 of 24** |
 
-Peak concurrency at the device was 1. The suite also covers the retry path, giving up
+Peak concurrency at the device was 1. Thirty checks in total: the retry path, giving up
 honestly instead of hanging forever, `hold()` excluding an outsider, budget accounting,
-and the one that matters most: **`kill -9` on the holder frees the device immediately.**
+binary responses surviving as bytes, a non-owner release being refused *before* the file
+is unlocked, the lock file being usable by a second user — and the one that matters most,
+**`kill -9` on the holder frees the device immediately.**
 
 To validate against a real device, on the machine that can reach it:
 
