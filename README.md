@@ -294,8 +294,9 @@ knowing that you are also signing up to keep it alive.
 ## Credits
 
 Built on the [Tiiny Pocket](https://tiiny.ai/) by Tiiny AI. Extracted from
-[WARBOARD](https://warboard.semfreak.dev) and
-[Story Lantern](https://github.com/webdevtodayjason/story-lantern), which taught it to us
-the hard way.
+[WARBOARD](https://warboard.semfreak.dev) and Story Lantern, which taught it to us the
+hard way.
+
+*This repository is private while an NDA with the vendor is in force (to 2026-09-30).*
 
 By [Jason Brashear](https://github.com/webdevtodayjason). Standard library only.
