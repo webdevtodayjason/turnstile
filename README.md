@@ -228,6 +228,38 @@ resident model" is not a synonym for "chat model".
 
 ---
 
+## Watching it
+
+The lock file carries a record of whoever holds it, written under the lock so the record
+and the lock can never disagree. `who()` reads it **without taking the lock**, so a
+dashboard can poll as often as it likes and never delay a real inference:
+
+```python
+import turnstile
+turnstile.who()
+```
+
+```python
+{"held": True, "owner": "warboard", "pid": 8412, "why": "enrich #1471",
+ "held_for_s": 4.2, "queue": 2,
+ "waiting": [{"owner": "story-lantern", "pid": 8477, "for_s": 1.4},
+             {"owner": "reverie",       "pid": 8476, "for_s": 1.4}]}
+```
+
+Label your application when you build it, and say what a `hold()` is for:
+
+```python
+t = Turnstile(owner="reverie")          # or set TURNSTILE_OWNER
+with t.hold("painting dream #412"):
+    ...
+```
+
+Waiters register themselves only once they are genuinely blocked, so an uncontended call
+costs nothing extra. A stale record from a crashed holder is harmless: readers only trust
+it while the file is actually locked.
+
+---
+
 ## Worked example
 
 ```bash

@@ -560,6 +560,34 @@ def main():
     check("six concurrent ledger writes all survive", len(book) == 6 and not errs,
           "%d of 6 kept, %d errors" % (len(book), len(errs)))
 
+    # (n) who() lets a dashboard see the holder and the queue WITHOUT taking the lock,
+    #     which is the only way a monitor is allowed to work: polling it must never
+    #     delay a real inference.
+    print("")
+    w0 = turnstile_mod.who(host=HOST)
+    check("who() reports a free device", w0["held"] is False and w0["queue"] == 0)
+    holder = Turnstile(host=HOST, port=PORT, key="x", owner="warboard")
+    with holder.hold("enrich #1471"):
+        w1 = turnstile_mod.who(host=HOST)
+        # a second PROCESS queues behind it
+        WAITER = ("import os,sys,time\n"
+                  "sys.path.insert(0,%r)\n" % os.path.dirname(os.path.dirname(os.path.abspath(__file__))) +
+                  "os.environ['TURNSTILE_DIR']=%r\n" % os.environ["TURNSTILE_DIR"] +
+                  "import turnstile as T\n"
+                  "t=T.Turnstile(host=%r,port=%d,key='x',owner='reverie')\n" % (HOST, PORT) +
+                  "t._lock.why='painting'\n"
+                  "t._lock.acquire(timeout=3.0) and t._lock.release()\n")
+        kid2 = subprocess.Popen([sys.executable, "-c", WAITER])
+        time.sleep(1.0)
+        w2 = turnstile_mod.who(host=HOST)
+        kid2.wait(timeout=30)
+    w3 = turnstile_mod.who(host=HOST)
+    check("who() names the holder", w1["held"] and w1["owner"] == "warboard", str(w1["owner"]))
+    check("who() carries what it is doing", w1["why"] == "enrich #1471", str(w1["why"]))
+    check("who() shows the queue", w2["queue"] >= 1 and
+          any(x["owner"] == "reverie" for x in w2["waiting"]), str(w2["waiting"]))
+    check("who() clears once released", w3["held"] is False and w3["queue"] == 0)
+
     srv.shutdown()
     print("\n%s  (%d checks failed)" % ("ALL PASS" if not failures else "FAILURES: " + ", ".join(failures),
                                         len(failures)))

@@ -70,7 +70,7 @@ import urllib.error
 import urllib.request
 import weakref
 
-__all__ = ["Turnstile", "DeviceBusy", "DeviceError", "Budget"]
+__all__ = ["Turnstile", "DeviceBusy", "DeviceError", "Budget", "who"]
 
 DEFAULT_PORT = 8800
 NPU_TOTAL = 100
@@ -217,6 +217,71 @@ def _same_file(path, fd):
     return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
 
 
+def _holder_path(lock_path):
+    return lock_path                      # the lock file itself carries the record
+
+
+def _waiters_dir(lock_path):
+    return lock_path + ".waiting"
+
+
+def who(host=None, port=DEFAULT_PORT, lock_key=None, path=None):
+    """Who has the device right now, and who is queued behind them.
+
+    Readers do not take the lock — they test it non-blockingly and read the record the
+    holder wrote. That means a dashboard can poll this as often as it likes without ever
+    delaying an actual inference, which is the only way a monitor is allowed to work.
+
+        {"held": True, "owner": "warboard", "pid": 8412, "why": "enrich #1471",
+         "held_for_s": 4.2, "waiting": [{"owner": "reverie", "pid": 913, "for_s": 1.1}]}
+    """
+    if path is None:
+        t = Turnstile.__new__(Turnstile)   # no connection, we only want the path
+        t.host = host or os.environ.get("TIINY_HOST") or "127.0.0.1"
+        ident = lock_key or _device_identity(t.host)
+        safe = "".join(c if c.isalnum() else "-" for c in ident).strip("-") or "device"
+        key_id = "%s-%s" % (safe[:32], hashlib.sha1(ident.encode()).hexdigest()[:8])
+        path = os.path.join(_default_lock_dir(), "turnstile-%s.lock" % key_id)
+
+    out = {"held": False, "owner": None, "pid": None, "why": None,
+           "held_for_s": None, "waiting": [], "lock": path}
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError:
+        return out                        # no lock file yet: nobody has ever used it
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        except OSError:
+            out["held"] = True
+        try:
+            rec = json.loads(os.read(fd, 4096).decode("utf-8", "replace") or "{}")
+        except ValueError:
+            rec = {}
+    finally:
+        os.close(fd)
+    if out["held"]:
+        out.update(owner=rec.get("owner"), pid=rec.get("pid"), why=rec.get("why"))
+        if rec.get("since"):
+            out["held_for_s"] = round(time.time() - float(rec["since"]), 2)
+    now = time.time()
+    try:
+        for fn in os.listdir(_waiters_dir(path)):
+            try:
+                with open(os.path.join(_waiters_dir(path), fn)) as fh:
+                    w = json.load(fh)
+                out["waiting"].append({"owner": w.get("owner"), "pid": w.get("pid"),
+                                       "for_s": round(now - float(w.get("since") or now), 2)})
+            except (OSError, ValueError):
+                continue
+    except OSError:
+        pass
+    out["waiting"].sort(key=lambda w: -(w["for_s"] or 0))
+    out["queue"] = len(out["waiting"])
+    return out
+
+
 def _reset_after_fork():
     """A forked child inherits the parent's lock, which it does not own.
 
@@ -292,8 +357,10 @@ class _CrossProcessLock:
     technical one.
     """
 
-    def __init__(self, path):
+    def __init__(self, path, owner=None):
         self.path = path
+        self.owner = owner or os.environ.get("TURNSTILE_OWNER") or "app"
+        self.why = None
         self._fh = None
         self._depth = 0
         self._owner = None
@@ -313,6 +380,7 @@ class _CrossProcessLock:
         # Everything from here until _depth is set must hand the RLock back on the way
         # out, or one bad open() wedges this process for good.
         fh = None
+        queued = None
         try:
             fh = _open_shared(self.path)
             while True:
@@ -332,6 +400,7 @@ class _CrossProcessLock:
                     self._fh = fh
                     self._owner = threading.get_ident()
                     self._depth = 1
+                    self._stamp()
                     fh = None                # owned by self now; don't close it below
                     return True
                 except OSError as exc:
@@ -339,12 +408,62 @@ class _CrossProcessLock:
                         raise
                     if deadline is not None and time.time() >= deadline:
                         return False
+                    if queued is None:
+                        # Only announce ourselves once we are genuinely blocked. An
+                        # uncontended acquire should not touch the filesystem twice.
+                        queued = self._queued()
+                        queued.__enter__()
                     time.sleep(0.05 + random.random() * 0.05)
         finally:
+            if queued is not None:
+                queued.__exit__(None, None, None)
             if self._depth == 0:             # we are leaving without the lock
                 if fh is not None:
                     os.close(fh)
                 self._local.release()
+
+    def _stamp(self):
+        """Record who we are, inside the file we just locked.
+
+        Writing under the lock means the record and the lock can never disagree. A stale
+        record left by a crashed holder is harmless: readers only trust it when the file
+        is actually locked, and it gets overwritten by the next holder.
+        """
+        try:
+            blob = json.dumps({"owner": self.owner, "pid": os.getpid(),
+                               "why": self.why, "since": time.time()}).encode()
+            os.lseek(self._fh, 0, os.SEEK_SET)
+            os.ftruncate(self._fh, 0)
+            os.write(self._fh, blob)
+            os.fsync(self._fh)
+        except OSError:
+            pass                          # observability must never break the lock
+
+    @contextlib.contextmanager
+    def _queued(self):
+        """Announce that we are waiting, so a monitor can show the queue."""
+        den = _waiters_dir(self.path)
+        mine = None
+        try:
+            os.makedirs(den, 0o1777, exist_ok=True)
+            try:
+                os.chmod(den, 0o1777)
+            except OSError:
+                pass
+            mine = os.path.join(den, "%d-%d.json" % (os.getpid(), threading.get_ident()))
+            with open(mine, "w") as fh:
+                json.dump({"owner": self.owner, "pid": os.getpid(),
+                           "why": self.why, "since": time.time()}, fh)
+        except OSError:
+            mine = None
+        try:
+            yield
+        finally:
+            if mine:
+                try:
+                    os.remove(mine)
+                except OSError:
+                    pass
 
     def release(self):
         if not self._depth:
@@ -454,7 +573,7 @@ class Budget:
 class Turnstile:
     def __init__(self, host=None, key=None, port=DEFAULT_PORT,
                  tries=6, base_delay=2.0, max_delay=30.0, timeout=300.0,
-                 on_wait=None, lock_key=None, settle_s=60.0):
+                 on_wait=None, lock_key=None, settle_s=60.0, owner=None):
         self.host = host or os.environ.get("TIINY_HOST") or "127.0.0.1"
         self.key = key or os.environ.get("TIINY_KEY") or ""
         self.base = "http://%s:%d" % (self.host, int(port))
@@ -481,8 +600,11 @@ class Turnstile:
         ident = lock_key or _device_identity(self.host)
         safe = "".join(c if c.isalnum() else "-" for c in ident).strip("-") or "device"
         self.key_id = "%s-%s" % (safe[:32], hashlib.sha1(ident.encode()).hexdigest()[:8])
+        # A label so a monitor can say WHO has the device, not just that it is busy.
+        self.owner = owner or os.environ.get("TURNSTILE_OWNER") or "app"
         self._lock = _lock_for(os.path.join(_default_lock_dir(),
                                             "turnstile-%s.lock" % self.key_id))
+        self._lock.owner = self.owner
         self.budget = Budget(self)
 
     # -- plumbing ---------------------------------------------------------- #
@@ -605,6 +727,9 @@ class Turnstile:
                 attempt += 1
                 settle_now = False
                 if not held:
+                    self._lock.owner = self.owner
+                    if self._lock.why is None:
+                        self._lock.why = path
                     if not self._lock.acquire(timeout=None):
                         raise DeviceBusy("could not take the device lock")
                     held = True
@@ -679,8 +804,13 @@ class Turnstile:
         `wait` bounds how long we queue for our turn, not how long we may keep it.
         None waits forever; a number raises DeviceBusy if the door never opens.
         """
-        with self._lock.held(timeout=wait):
-            yield self
+        prev = self._lock.why
+        self._lock.owner, self._lock.why = self.owner, (why or None)
+        try:
+            with self._lock.held(timeout=wait):
+                yield self
+        finally:
+            self._lock.why = prev
 
     # -- the calls people actually make ------------------------------------ #
 
