@@ -601,6 +601,89 @@ def main():
           "queue=%d %s" % (w4["queue"], w4["waiting"]))
     check("and its file is swept", not os.path.exists(ghost))
 
+    # A monitor that perturbs what it measures is worse than no monitor. who() used to
+    # probe with flock(LOCK_EX|LOCK_NB), which briefly TAKES the lock whenever the device
+    # is free: measured 24 of 400 uncontended acquires failing first try while a
+    # dashboard polled. It must now be provably passive.
+    lk = holder._lock
+    stop_poll = threading.Event()
+
+    def poller():
+        while not stop_poll.is_set():
+            turnstile_mod.who(path=lk.path)
+
+    pth2 = threading.Thread(target=poller, daemon=True)
+    pth2.start()
+    missed = 0
+    for _ in range(300):
+        if lk.acquire(timeout=0):
+            lk.release()
+        else:
+            missed += 1
+    stop_poll.set()
+    pth2.join(timeout=5)
+    check("polling who() never steals the lock", missed == 0, "%d/300 first-try misses" % missed)
+
+    # THE WORST BUG THIS LIBRARY HAS HAD. _stamp() runs after the flock is taken and
+    # _depth is set, so anything it raises escapes acquire() still holding the lock,
+    # with no context manager left to release it. A caller passing a Path as `why` hit
+    # json.dumps -> TypeError -> the device was wedged for every process on the machine
+    # until that process died.
+    import pathlib as _pl
+    weird = Turnstile(host=HOST, port=PORT, key="x", owner="weird")
+    with weird.hold(why=_pl.Path("/tmp/page-42")):
+        pass
+    check("a non-serialisable `why` cannot wedge the device",
+          weird._lock._depth == 0 and weird._lock._fh is None,
+          "depth=%s fh=%s" % (weird._lock._depth, weird._lock._fh))
+    probe3 = subprocess.run([sys.executable, "-c", OUTSIDER, weird._lock.path],
+                            capture_output=True, text=True).stdout.strip()
+    check("and the device is still usable afterwards", probe3 == "GOT", probe3)
+
+    # The waiter file lives in a world-writable directory under a guessable name, so a
+    # planted symlink must not redirect the write into a file the user owns.
+    den3 = turnstile_mod._waiters_dir(weird._lock.path)
+    os.makedirs(den3, exist_ok=True)
+    victim = os.path.join(os.environ["TURNSTILE_DIR"], "VICTIM.txt")
+    with open(victim, "w") as fh:
+        fh.write("PRECIOUS")
+    link = os.path.join(den3, "%d-%d.json" % (os.getpid(), threading.get_ident()))
+    try:
+        os.unlink(link)
+    except OSError:
+        pass
+    os.symlink(victim, link)
+    blocker = turnstile_mod._lock_for(weird._lock.path)
+    blocker.acquire()
+    th4 = threading.Thread(target=lambda: weird._lock.acquire(timeout=1.0) and weird._lock.release())
+    th4.start(); th4.join()
+    blocker.release()
+    with open(victim) as fh:
+        still = fh.read()
+    check("a symlinked waiter file cannot overwrite its target", still == "PRECIOUS",
+          "victim now %r" % still[:40])
+    for f in (victim, link):
+        try:
+            os.unlink(f)
+        except OSError:
+            pass
+
+    # A hostile file in the world-writable queue directory must not break a poll.
+    den2 = turnstile_mod._waiters_dir(lk.path)
+    os.makedirs(den2, exist_ok=True)
+    junk = os.path.join(den2, "99999998-1.json")
+    with open(junk, "w") as fh:
+        fh.write("x" * 200000)              # not JSON, and far over the read cap
+    try:
+        w5 = turnstile_mod.who(path=lk.path)
+        check("garbage in the queue dir does not break who()", isinstance(w5, dict))
+    except Exception as exc:
+        check("garbage in the queue dir does not break who()", False, type(exc).__name__)
+    try:
+        os.unlink(junk)
+    except OSError:
+        pass
+
     srv.shutdown()
     print("\n%s  (%d checks failed)" % ("ALL PASS" if not failures else "FAILURES: " + ", ".join(failures),
                                         len(failures)))

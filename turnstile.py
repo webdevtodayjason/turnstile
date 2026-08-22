@@ -120,6 +120,12 @@ LOCK_DIR = _default_lock_dir()
 # create it 0644, so the second user to arrive gets PermissionError instead of a lock.
 LOCK_MODE = 0o666
 
+# The holder record is written at a fixed width so a reader never sees a partial one.
+RECORD_BYTES = 512
+
+# A dashboard read is bounded no matter what is in the queue directory.
+MAX_WAITERS = 256
+
 
 class DeviceBusy(RuntimeError):
     """The device stayed busy for the whole retry budget."""
@@ -266,28 +272,49 @@ def who(host=None, port=DEFAULT_PORT, lock_key=None, path=None):
         return out                        # no lock file yet: nobody has ever used it
     try:
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        except OSError:
-            out["held"] = True
-        try:
-            rec = json.loads(os.read(fd, 4096).decode("utf-8", "replace") or "{}")
+            rec = json.loads(os.read(fd, RECORD_BYTES).decode("utf-8", "replace") or "{}")
         except ValueError:
             rec = {}
     finally:
         os.close(fd)
-    if out["held"]:
-        out.update(owner=rec.get("owner"), pid=rec.get("pid"), why=rec.get("why"))
-        if rec.get("since"):
-            out["held_for_s"] = round(time.time() - float(rec["since"]), 2)
+    if not isinstance(rec, dict):
+        rec = {}
+    # Deliberately NO flock probe here. Testing the lock with LOCK_EX|LOCK_NB briefly
+    # TAKES it whenever the device is free, so a polling dashboard made real callers see
+    # contention and back off — measured at 6% of uncontended acquires failing first try
+    # while a monitor ran. A monitor that perturbs what it measures is worse than no
+    # monitor. Held is derived from the record instead: the holder clears it on release,
+    # so a record that is still present belongs either to a live holder or to one that
+    # died without cleaning up, and the pid tells us which.
+    pid = rec.get("pid")
+    try:
+        pid = int(pid) if pid is not None else None
+    except (TypeError, ValueError):
+        pid = None
+    if rec.get("owner") and _alive(pid):
+        out["held"] = True
+        out.update(owner=rec.get("owner"), pid=pid, why=rec.get("why"))
+        try:
+            out["held_for_s"] = round(time.time() - float(rec.get("since") or 0), 2)
+        except (TypeError, ValueError):
+            pass
     now = time.time()
     try:
         den = _waiters_dir(path)
-        for fn in os.listdir(den):
+        # The queue directory is world-writable, so its contents are untrusted input:
+        # bounded in number, opened without following symlinks, and read with a size cap
+        # so a planted file cannot turn a dashboard poll into a large read.
+        for fn in sorted(os.listdir(den))[:MAX_WAITERS]:
             full = os.path.join(den, fn)
             try:
-                with open(full) as fh:
-                    w = json.load(fh)
+                wfd = os.open(full, os.O_RDONLY | os.O_NOFOLLOW)
+                try:
+                    raw = os.read(wfd, RECORD_BYTES)
+                finally:
+                    os.close(wfd)
+                w = json.loads(raw.decode("utf-8", "replace") or "{}")
+                if not isinstance(w, dict):
+                    continue
                 pid = int(w.get("pid") or 0)
             except (OSError, ValueError, TypeError):
                 continue
@@ -456,15 +483,32 @@ class _CrossProcessLock:
         record left by a crashed holder is harmless: readers only trust it when the file
         is actually locked, and it gets overwritten by the next holder.
         """
+        self._write_record({"owner": self.owner, "pid": os.getpid(),
+                            "why": self.why, "since": time.time()})
+
+    def _write_record(self, rec):
+        """Replace the holder record with a single fixed-width write.
+
+        Padded to RECORD_BYTES and never truncated, so a reader can never catch the file
+        empty or half-rewritten. ftruncate-then-write left exactly that window: a
+        dashboard polling at the wrong microsecond saw an empty file and reported the
+        device free while it was in use.
+        """
         try:
-            blob = json.dumps({"owner": self.owner, "pid": os.getpid(),
-                               "why": self.why, "since": time.time()}).encode()
+            # default=str so a caller passing a Path, a UUID or anything else non-JSON
+            # as `why` cannot raise here, and a bare `except Exception` behind it so
+            # nothing else can either. This is not defensive padding: _stamp() runs
+            # AFTER the flock is taken and _depth is set, so an exception escaping it
+            # left acquire() holding the lock with no context manager to release it —
+            # the device stayed wedged for every process until the holder died.
+            # Observability must never break the lock; that has to be structurally
+            # true, not merely intended.
+            blob = json.dumps(rec, default=str).encode()[:RECORD_BYTES - 1]
+            blob = blob + b" " * (RECORD_BYTES - len(blob))
             os.lseek(self._fh, 0, os.SEEK_SET)
-            os.ftruncate(self._fh, 0)
             os.write(self._fh, blob)
-            os.fsync(self._fh)
-        except OSError:
-            pass                          # observability must never break the lock
+        except Exception:
+            pass
 
     @contextlib.contextmanager
     def _queued(self):
@@ -477,11 +521,22 @@ class _CrossProcessLock:
                 os.chmod(den, 0o1777)
             except OSError:
                 pass
+            # Only publish into a directory we own. In a world-writable place the
+            # path is guessable, and plain open() follows symlinks — a link planted at
+            # <pid>-<tid>.json redirected this write into an arbitrary file the user
+            # owned. The lock file already used O_NOFOLLOW; this one did not.
+            if os.stat(den).st_uid != os.geteuid():
+                raise OSError("queue directory belongs to someone else")
             mine = os.path.join(den, "%d-%d.json" % (os.getpid(), threading.get_ident()))
-            with open(mine, "w") as fh:
-                json.dump({"owner": self.owner, "pid": os.getpid(),
-                           "why": self.why, "since": time.time()}, fh)
-        except OSError:
+            blob = json.dumps({"owner": self.owner, "pid": os.getpid(),
+                               "why": self.why, "since": time.time()},
+                              default=str).encode()[:RECORD_BYTES]
+            wfd = os.open(mine, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644)
+            try:
+                os.write(wfd, blob)
+            finally:
+                os.close(wfd)
+        except Exception:
             mine = None
         try:
             yield
@@ -504,6 +559,7 @@ class _CrossProcessLock:
         self._depth -= 1
         if self._depth == 0:
             self._owner = None
+            self._write_record({})        # released: leave nothing claiming the device
             fh, self._fh = self._fh, None
             # No explicit LOCK_UN: closing the descriptor drops the flock, and the
             # separate unlock call was the only thing here that could raise. When it
