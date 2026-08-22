@@ -33,9 +33,12 @@ echo "== 2. one real inference through the turnstile =="
 python3 - <<'PY' || exit 1
 import time, turnstile
 t = turnstile.Turnstile(on_wait=lambda a, d, why: print("   waited %.1fs (%s)" % (d, why)))
-model = next((m for m, u, s in t.budget.resident() if s == "running" and u >= 20), None)
+chat = [(u, m) for m, u, s in t.budget.resident()
+        if s == "running" and u >= 20 and not any(
+            k in m.lower() for k in ("image", "tts", "asr", "embedding", "reranker", "vision"))]
+model = max(chat)[1] if chat else None
 if not model:
-    print("   no chat-sized model resident; start one and re-run"); raise SystemExit(1)
+    print("   no chat model resident; start one and re-run"); raise SystemExit(1)
 t0 = time.time()
 out = t.chat(model, [{"role": "user", "content": "Reply with exactly: turnstile ok"}], max_tokens=600)
 print("   %s -> %r in %.1fs" % (model, out[:60], time.time() - t0))
@@ -47,7 +50,10 @@ python3 - <<'PY'
 import json, os, subprocess, sys, time, turnstile
 
 t = turnstile.Turnstile()
-model = next((m for m, u, s in t.budget.resident() if s == "running" and u >= 20), None)
+chat = [(u, m) for m, u, s in t.budget.resident()
+        if s == "running" and u >= 20 and not any(
+            k in m.lower() for k in ("image", "tts", "asr", "embedding", "reranker", "vision"))]
+model = max(chat)[1] if chat else None
 if not model:
     print("   no chat-sized model resident"); raise SystemExit(1)
 
