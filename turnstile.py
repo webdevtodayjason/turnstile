@@ -55,6 +55,7 @@ Everything blocks until the device is free. That is the point.
 import contextlib
 import errno
 import fcntl
+import hashlib
 import json
 import os
 import random
@@ -250,7 +251,14 @@ class Turnstile:
         # on_wait(attempt, delay, why) — hook so an application can say "device busy"
         # in its own UI instead of going silent.
         self.on_wait = on_wait
-        self.key_id = "".join(c for c in self.host if c.isalnum()) or "device"
+        # Identifies the lock FILE, so it has to be one-to-one with the device. Keeping
+        # the readable host in the name helps when someone is staring at a temp dir, but
+        # stripping the dots alone collides (172.17.7.177 and 17.21.77.177 both become
+        # 172177177) and would make two separate devices queue behind each other.
+        # The port is deliberately NOT included: one Tiiny exposes several ports and
+        # they all contend for the same NPU, so they must share a lock.
+        safe = "".join(c if c.isalnum() else "-" for c in self.host).strip("-") or "device"
+        self.key_id = "%s-%s" % (safe[:32], hashlib.sha1(self.host.encode()).hexdigest()[:8])
         self._lock = _lock_for(os.path.join(LOCK_DIR, "turnstile-%s.lock" % self.key_id))
         self.budget = Budget(self)
 

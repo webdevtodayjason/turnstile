@@ -293,6 +293,19 @@ def main():
     got = b.chat("fake/chat-35B", [{"role": "user", "content": "hi"}])
     check("device still usable afterwards", got == "ok")
 
+    # (d) Different devices must not share a lock file. Stripping punctuation out of the
+    #     host collided (172.17.7.177 and 17.21.77.177 both became 172177177), which
+    #     silently serialised two unrelated Tiinys against each other.
+    one = Turnstile(host="172.17.7.177", key="x")
+    two = Turnstile(host="17.21.77.177", key="x")
+    check("different hosts get different locks", one._lock.path != two._lock.path,
+          os.path.basename(one._lock.path))
+    check("same host still shares a lock",
+          Turnstile(host="172.17.7.177", key="x")._lock is one._lock)
+    check("different ports on one device share a lock",
+          Turnstile(host="172.17.7.177", port=9098, key="x")._lock is one._lock,
+          "one NPU, so they must queue together")
+
     srv.shutdown()
     print("\n%s  (%d checks failed)" % ("ALL PASS" if not failures else "FAILURES: " + ", ".join(failures),
                                         len(failures)))
