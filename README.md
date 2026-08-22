@@ -67,6 +67,13 @@ fancier design would have bought.
 The trade is that the lock is *advisory*: a program that ignores Turnstile still collides.
 That is a social problem, not a technical one, and every alternative has the same hole.
 
+**And it is per-host.** `fcntl.flock` coordinates processes on one machine. If two
+applications on *different* machines point at the same Tiiny, they share no lock file and
+get no mutual exclusion whatsoever — "every call goes through Turnstile" reads like a
+guarantee, and across machines it is not one. Same-host neighbours only. If you need
+cross-machine coordination you need a broker, and you should write one knowing you are
+also signing up to keep it alive.
+
 ---
 
 ## What it handles for you
