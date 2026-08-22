@@ -334,6 +334,34 @@ def main():
         check("declined image raises instead of returning a dict", False, type(exc).__name__)
     DEV.decline_image = False
 
+    # (f) A thread releasing a lock it does not hold must be refused BEFORE the file is
+    #     unlocked, or the device is handed away while the real owner is still using it.
+    print("")
+    guard = {"raised": None, "still_held": None}
+
+    def thief():
+        try:
+            t._lock.release()
+            guard["raised"] = False
+        except RuntimeError:
+            guard["raised"] = True
+
+    t._lock.acquire()
+    th2 = threading.Thread(target=thief)
+    th2.start(); th2.join()
+    # the owner must still hold it: a fresh process must still be locked out
+    probe = subprocess.run([sys.executable, "-c",
+                            "import fcntl,sys\n"
+                            "fh=open(%r,'a+')\n" % t._lock.path +
+                            "try:\n"
+                            "  fcntl.flock(fh.fileno(), fcntl.LOCK_EX|fcntl.LOCK_NB); print('GOT')\n"
+                            "except OSError: print('BLOCKED')\n"], capture_output=True, text=True)
+    guard["still_held"] = "BLOCKED" in probe.stdout
+    t._lock.release()
+    check("non-owner release is refused", guard["raised"] is True)
+    check("device stayed locked through the attempt", guard["still_held"] is True,
+          "would have been stolen mid-inference")
+
     srv.shutdown()
     print("\n%s  (%d checks failed)" % ("ALL PASS" if not failures else "FAILURES: " + ", ".join(failures),
                                         len(failures)))

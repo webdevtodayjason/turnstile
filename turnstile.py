@@ -129,6 +129,7 @@ class _CrossProcessLock:
         self.path = path
         self._fh = None
         self._depth = 0
+        self._owner = None
         self._local = threading.RLock()
 
     def acquire(self, timeout=None):
@@ -151,6 +152,7 @@ class _CrossProcessLock:
                     fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
                     self._fh = fh
                     self._depth = 1
+                    self._owner = threading.get_ident()
                     fh = None                # owned by self now; don't close it below
                     return True
                 except OSError as exc:
@@ -168,8 +170,15 @@ class _CrossProcessLock:
     def release(self):
         if not self._depth:
             return
+        # Refuse before touching anything. Without this, a thread releasing a lock it
+        # does not hold would unlock the FILE first and only then hit the RLock's own
+        # RuntimeError — handing the device to everyone else while the real owner is
+        # still mid-inference and believes it holds the lock.
+        if self._owner != threading.get_ident():
+            raise RuntimeError("release() from a thread that does not hold the lock")
         self._depth -= 1
         if self._depth == 0:
+            self._owner = None
             try:
                 fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
             finally:
