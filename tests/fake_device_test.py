@@ -16,6 +16,7 @@ import json
 import os
 import subprocess
 import sys
+import stat as _stat2
 import threading
 import time
 import urllib.error
@@ -28,6 +29,7 @@ from turnstile import Turnstile, DeviceBusy, DeviceError, _CrossProcessLock  # n
 
 HOST, PORT = "127.0.0.1", 8899
 WORK_S = 0.12          # how long a fake inference "takes"
+SLOW_S = 1.5           # a call that outlives the client's patience
 
 
 class Device:
@@ -90,6 +92,16 @@ class Handler(BaseHTTPRequestHandler):
         self.rfile.read(n)
         if self.path.startswith("/api/v1/models/"):
             return self._send(200, {"ok": True})
+        if self.path == "/v1/slow":
+            # Occupies the device for longer than the client's own timeout, which is
+            # the whole point: the caller stops waiting while the device keeps working.
+            if not DEV.enter():
+                return self._send(200, {"code": 150004, "message": "busy"})
+            try:
+                time.sleep(SLOW_S)
+            finally:
+                DEV.leave()
+            return self._send(200, {"ok": True})
         if self.path == "/v1/image/generate":
             # The real device answers with raw PNG bytes, or a JSON body when it
             # declines. Both shapes have to reach the caller correctly.
@@ -124,6 +136,30 @@ def stats():
 def _worker():
     mode, calls = sys.argv[2], int(sys.argv[3])
     ok = err = 0
+    if mode == "timeout":
+        # Give up on the socket well before the device finishes. The device is still
+        # computing when we stop listening.
+        t = Turnstile(host=HOST, port=PORT, key="x", tries=1,
+                      base_delay=0.1, max_delay=0.1, timeout=0.3, settle_s=1.9)
+        try:
+            t.call("/v1/slow", {})
+        except Exception:
+            pass
+        print(json.dumps({"ok": 0, "err": 0}))
+        return
+    if mode == "follower":
+        time.sleep(0.25)          # arrive while the first worker is timing out
+        # tries=1 on purpose: no retry to paper over a collision. If this worker is let
+        # in while the device is still busy, it fails, and that failure is the finding.
+        t = Turnstile(host=HOST, port=PORT, key="x", tries=1, base_delay=0.1)
+        for _ in range(calls):
+            try:
+                t.chat("fake/chat-35B", [{"role": "user", "content": "hi"}])
+                ok += 1
+            except Exception:
+                err += 1
+        print(json.dumps({"ok": ok, "err": err}))
+        return
     if mode == "turnstile":
         t = Turnstile(host=HOST, port=PORT, key="x", tries=8, base_delay=0.05, max_delay=0.4)
         for _ in range(calls):
@@ -202,7 +238,9 @@ def main():
                   on_wait=lambda a, d, why: waits.append(why))
     got = t.chat("fake/chat-35B", [{"role": "user", "content": "hi"}])
     check("survived transient busy", got == "ok", "%d retries, reasons %s" % (len(waits), set(waits)))
-    check("recognised it as device 150004", all("150004" in w for w in waits), str(waits))
+    check("actually retried (on_wait fired)", len(waits) == 3, "%d waits" % len(waits))
+    check("recognised it as device 150004",
+          bool(waits) and all("150004" in w for w in waits), str(waits))
 
     # 4. Give up honestly rather than hanging forever.
     print("\n-- give up: device is busy for good --")
@@ -218,23 +256,25 @@ def main():
     # 5. hold() keeps a sequence together.
     print("\n-- hold: a multi-call sequence is not interleaved --")
     DEV.peak = DEV.collisions = 0
-    intruder = {"got_in": None}
-
-    def outsider():
-        o = Turnstile(host=HOST, port=PORT, key="x", tries=1)
-        time.sleep(0.05)
-        intruder["got_in"] = o._lock.acquire(timeout=0.05)
-        if intruder["got_in"]:
-            o._lock.release()
-
-    th = threading.Thread(target=outsider)
+    # The outsider must be a genuinely separate PROCESS. An in-process Turnstile now
+    # shares the same lock object by design, so probing with one would only re-test
+    # threading.RLock -- it would pass with fcntl.flock deleted entirely, which is
+    # exactly how this check silently stopped proving anything.
+    lockpath = t._lock.path
+    OUTSIDER = ("import fcntl,sys\n"
+                "fh=open(sys.argv[1],'a+')\n"
+                "try:\n"
+                "  fcntl.flock(fh.fileno(), fcntl.LOCK_EX|fcntl.LOCK_NB); print('GOT')\n"
+                "except OSError: print('BLOCKED')\n")
     with t.hold("a sequence"):
-        th.start()
+        during = subprocess.run([sys.executable, "-c", OUTSIDER, lockpath],
+                                capture_output=True, text=True).stdout.strip()
         t.chat("fake/chat-35B", [{"role": "user", "content": "1"}])
         t.chat("fake/chat-35B", [{"role": "user", "content": "2"}])
-    th.join()
-    check("outsider was kept out during hold", intruder["got_in"] is False)
-    check("no collisions during hold", stats()["collisions"] == 0)
+    after = subprocess.run([sys.executable, "-c", OUTSIDER, lockpath],
+                           capture_output=True, text=True).stdout.strip()
+    check("another PROCESS is locked out during hold", during == "BLOCKED", during)
+    check("and gets in once the hold ends", after == "GOT", after)
 
     # 6. A crashed holder must not wedge the device.
     print("\n-- crash: lock dies with the process that held it --")
@@ -269,12 +309,18 @@ def main():
         bad.acquire(timeout=0.2)
     except OSError:
         pass
-    check("failed acquire releases the in-process lock",
-          bad._local.acquire(timeout=0.5) is True, "would hang forever if leaked")
-    try:
-        bad._local.release()
-    except RuntimeError:
-        pass
+    # Probe from ANOTHER thread: RLock is reentrant, so a same-thread acquire returns
+    # True whether or not the lock leaked, and the check would pass with the fix removed.
+    leaked = {"free": None}
+
+    def probe():
+        leaked["free"] = bad._local.acquire(timeout=0.5)
+        if leaked["free"]:
+            bad._local.release()
+
+    pth = threading.Thread(target=probe); pth.start(); pth.join()
+    check("failed acquire releases the in-process lock", leaked["free"] is True,
+          "another thread would hang forever if it leaked")
 
     # (b) A hostname that cannot resolve is not 'busy'. It must fail now, not after the
     #     whole backoff ladder.
@@ -315,6 +361,15 @@ def main():
           os.path.basename(one._lock.path))
     check("same host still shares a lock",
           Turnstile(host="172.17.7.177", key="x")._lock is one._lock)
+    # Spelling must not key the lock: one app setting TIINY_HOST=localhost while the
+    # other leaves it at the 127.0.0.1 default is the most likely real-world hit.
+    check("localhost and 127.0.0.1 are the same device",
+          Turnstile(host="localhost", key="x")._lock is Turnstile(host="127.0.0.1", key="x")._lock)
+    check("case and a trailing dot do not split the lock",
+          Turnstile(host="LOCALHOST.", key="x")._lock is Turnstile(host="localhost", key="x")._lock)
+    check("lock_key overrides identity when you need it",
+          Turnstile(host="a.invalid", key="x", lock_key="dev1")._lock is
+          Turnstile(host="b.invalid", key="x", lock_key="dev1")._lock)
     check("different ports on one device share a lock",
           Turnstile(host="172.17.7.177", port=9098, key="x")._lock is one._lock,
           "one NPU, so they must queue together")
@@ -374,6 +429,81 @@ def main():
     check("lock file is group/other writable", mode == 0o666, "mode %o" % mode)
     check("lock dir is shared between users", not turnstile_mod.LOCK_DIR.startswith("/var/folders"),
           turnstile_mod.LOCK_DIR)
+
+    # (h) THE ONE THAT MATTERS MOST. A client-side timeout does not mean the device
+    #     stopped working — our request is very likely still running on it. Releasing
+    #     the lock there hands it to a cooperating peer who then collides with our own
+    #     in-flight inference. Without the fix this reproduces reliably.
+    print("")
+    DEV.peak = DEV.collisions = DEV.served = 0
+    me = os.path.abspath(__file__)
+    procs = [subprocess.Popen([sys.executable, me, "--worker", "timeout", "1"],
+                              stdout=subprocess.PIPE, text=True),
+             subprocess.Popen([sys.executable, me, "--worker", "follower", "1"],
+                              stdout=subprocess.PIPE, text=True)]
+    outs = []
+    for pr in procs:
+        so, _ = pr.communicate(timeout=180)
+        outs.append(json.loads(so.strip().splitlines()[-1]))
+    follower = outs[1]
+    check("a peer is not let in while our request is still running",
+          follower["err"] == 0 and follower["ok"] == 1,
+          "follower ok=%d err=%d" % (follower["ok"], follower["err"]))
+
+    # (i) fork(): the child inherits the fd, the depth, the owner ident and the same
+    #     open file description. Without a reset it believes it holds the device, and
+    #     its release would drop the PARENT's flock mid-inference.
+    print("")
+    fl = _CrossProcessLock(os.path.join(os.path.dirname(t._lock.path), "turnstile-forkcheck.lock"))
+    fl.acquire()
+    r, w = os.pipe()
+    kid = os.fork()
+    if kid == 0:
+        os.close(r)
+        try:
+            msg = "%d|%s|%s" % (fl._depth, fl._owner, fl.acquire(timeout=0.3))
+        except BaseException as exc:
+            msg = "raised|%s|%s" % (type(exc).__name__, exc)
+        os.write(w, msg.encode())
+        os._exit(0)
+    os.close(w)
+    kid_msg = os.read(r, 200).decode()
+    os.waitpid(kid, 0)
+    depth_s, owner_s, got_s = kid_msg.split("|")
+    check("forked child does not inherit the lock", depth_s == "0" and owner_s == "None", kid_msg)
+    check("forked child cannot take the held device", got_s == "False", kid_msg)
+    probe2 = subprocess.run([sys.executable, "-c", OUTSIDER, fl.path],
+                            capture_output=True, text=True).stdout.strip()
+    check("parent still holds it after the child exits", probe2 == "BLOCKED", probe2)
+    fl.release()
+
+    # (j) The lock path is predictable and lives in a world-writable directory, so it
+    #     must never be followed as a symlink and then chmod'ed.
+    link = os.path.join(os.path.dirname(t._lock.path), "turnstile-symlinkcheck.lock")
+    target = link + ".victim"
+    for f in (link, target):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+    open(target, "w").close()
+    os.chmod(target, 0o600)
+    os.symlink(target, link)
+    try:
+        _CrossProcessLock(link).acquire(timeout=0.5)
+        check("refuses to follow a symlinked lock path", False, "followed it")
+    except DeviceError:
+        check("refuses to follow a symlinked lock path", True)
+    except OSError:
+        check("refuses to follow a symlinked lock path", True, "OSError")
+    victim_mode = _stat2.S_IMODE(os.stat(target).st_mode)
+    check("the symlink target was not made world-writable", victim_mode == 0o600,
+          "mode %o" % victim_mode)
+    for f in (link, target):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
 
     srv.shutdown()
     print("\n%s  (%d checks failed)" % ("ALL PASS" if not failures else "FAILURES: " + ", ".join(failures),

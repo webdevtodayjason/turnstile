@@ -66,6 +66,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
+import weakref
 
 __all__ = ["Turnstile", "DeviceBusy", "DeviceError", "Budget"]
 
@@ -118,25 +119,108 @@ class DeviceError(RuntimeError):
 # the lock
 # --------------------------------------------------------------------------- #
 
-def _open_shared(path):
-    """Open the lock file so any user sharing the device can lock it.
+_IDENTITY = {}
 
-    Returns a raw fd. O_CREAT respects the umask, which typically strips the group and
-    other write bits, so the mode is set explicitly afterwards. The chmod is best-effort:
-    if the file belongs to another user it will fail, and that is fine — it already has
-    the right mode or that user has already made their choice.
+
+def _device_identity(host):
+    """Reduce however this host was spelled to one identity per device.
+
+    'localhost' and '127.0.0.1' are the same Tiiny, but as raw strings they hash to two
+    lock files and coordinate with nobody — the silent failure again, the same shape as
+    the per-user temp directory. Resolving pins both to one address. When resolution
+    fails, the literal spelling is the honest fallback: over-serialising two names that
+    turn out to be one device only costs throughput, while under-serialising is a race.
     """
-    fd = os.open(path, os.O_RDWR | os.O_CREAT, LOCK_MODE)
+    got = _IDENTITY.get(host)
+    if got is None:
+        # Case and a trailing root dot are not distinctions the device knows about.
+        name = (host or "").strip().rstrip(".").lower() or "127.0.0.1"
+        try:
+            got = socket.gethostbyname(name)
+        except (socket.gaierror, UnicodeError, OSError):
+            got = name
+        _IDENTITY[host] = got
+    return got
+
+
+def _open_shared(path):
+    """Open the lock file so any user sharing the device can lock it — carefully.
+
+    The path is predictable and, by default, lives in a world-writable directory. That
+    combination plus a chmod is a classic symlink attack: someone pre-creates the path
+    as a link to a file you own, and your own process obligingly makes that file
+    world-writable. O_NOFOLLOW stops the link being followed, and the mode is only ever
+    changed on a plain file that we actually own with no other names pointing at it.
+
+    A hostile pre-created file is refused loudly rather than retried forever, because
+    the useful thing to tell someone in that situation is which path to move off.
+    """
     try:
-        if stat.S_IMODE(os.fstat(fd).st_mode) != LOCK_MODE:
-            os.fchmod(fd, LOCK_MODE)
-    except OSError:
-        pass
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, LOCK_MODE)
+    except OSError as exc:
+        if exc.errno in (errno.ELOOP, errno.EMLINK):
+            raise DeviceError(
+                "lock path %s is a symlink; refusing to follow it. "
+                "Set TURNSTILE_DIR to a directory you control." % path)
+        if exc.errno in (errno.EACCES, errno.EPERM):
+            raise DeviceError(
+                "cannot open lock file %s (permission denied). Another user may own it; "
+                "set TURNSTILE_DIR to a directory you share deliberately." % path)
+        raise
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            raise DeviceError("lock path %s is not a regular file" % path)
+        # Only widen permissions on a file that is unambiguously ours. Someone else's
+        # file either already allows this or is their decision to make, and a file with
+        # extra hard links is not one we can reason about.
+        if st.st_uid == os.geteuid() and st.st_nlink == 1 \
+                and stat.S_IMODE(st.st_mode) != LOCK_MODE:
+            try:
+                os.fchmod(fd, LOCK_MODE)
+            except OSError:
+                pass
+    except BaseException:
+        os.close(fd)
+        raise
     return fd
+
+
+def _reset_after_fork():
+    """A forked child inherits the parent's lock, which it does not own.
+
+    The fd, the depth, the owner ident and the RLock all survive fork, and the child's
+    fd refers to the SAME open file description — so the child believes it holds the
+    device, and worse, when the child's nesting unwinds it drops the flock out from
+    under a parent that is still mid-inference. The thread ident guard cannot catch this
+    because the child's main thread reuses the parent's ident.
+
+    Closing the child's copy of the descriptor does not disturb the parent's flock: the
+    lock lives on the open file description and survives while the parent's fd is open.
+    """
+    for lk in list(_ALL_LOCKS):
+        if lk._fh is not None:
+            try:
+                os.close(lk._fh)
+            except OSError:
+                pass
+        lk._fh = None
+        lk._depth = 0
+        lk._owner = None
+        lk._local = threading.RLock()       # the parent's RLock state is meaningless here
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_after_fork)
 
 
 _LOCKS = {}
 _LOCKS_GUARD = threading.Lock()
+
+# Every lock ever built, so the fork handler can reset all of them. Weak, so a lock that
+# goes out of scope is not kept alive by this. _LOCKS alone was not enough: a lock
+# constructed directly rather than through _lock_for would have been missed.
+_ALL_LOCKS = weakref.WeakSet()
 
 
 def _lock_for(path):
@@ -171,6 +255,7 @@ class _CrossProcessLock:
         self._depth = 0
         self._owner = None
         self._local = threading.RLock()
+        _ALL_LOCKS.add(self)
 
     def acquire(self, timeout=None):
         # Two gates: the in-process RLock keeps our own threads in line, the file lock
@@ -191,8 +276,8 @@ class _CrossProcessLock:
                 try:
                     fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     self._fh = fh
-                    self._depth = 1
                     self._owner = threading.get_ident()
+                    self._depth = 1
                     fh = None                # owned by self now; don't close it below
                     return True
                 except OSError as exc:
@@ -219,11 +304,17 @@ class _CrossProcessLock:
         self._depth -= 1
         if self._depth == 0:
             self._owner = None
+            fh, self._fh = self._fh, None
+            # No explicit LOCK_UN: closing the descriptor drops the flock, and the
+            # separate unlock call was the only thing here that could raise. When it
+            # did, this method exited before releasing the RLock, leaving the object
+            # reading _depth=0 / _owner=None / _fh=None — completely free — while every
+            # other thread in the process hung on it forever. Nothing between the
+            # decrement and the RLock release is allowed to throw.
             try:
-                fcntl.flock(self._fh, fcntl.LOCK_UN)
-            finally:
-                os.close(self._fh)
-                self._fh = None
+                os.close(fh)
+            except OSError:
+                pass
         self._local.release()
 
     @contextlib.contextmanager
@@ -276,12 +367,21 @@ class Budget:
         except Exception:
             book = {}
         book[str(model_id)] = {"units": int(units), "owner": str(owner), "ts": time.time()}
-        # Unique temp name: two processes noting at once would otherwise write the same
-        # file and one would rename a half-written copy over the other's.
-        tmp = "%s.%d.tmp" % (self.path, os.getpid())
-        with open(tmp, "w") as fh:
-            json.dump(book, fh, indent=1)
-        os.replace(tmp, self.path)
+        # mkstemp rather than a pid-derived name: a pid is not unique across threads in
+        # one process, and two containers sharing a mounted TURNSTILE_DIR can both be
+        # pid 1. Either way one writer renames a half-written file over the other's.
+        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(self.path) or ".",
+                                   prefix=".turnstile-budget-")
+        try:
+            with os.fdopen(fd, "w") as fh:
+                json.dump(book, fh, indent=1)
+            os.replace(tmp, self.path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
         return book
 
 
@@ -292,7 +392,7 @@ class Budget:
 class Turnstile:
     def __init__(self, host=None, key=None, port=DEFAULT_PORT,
                  tries=6, base_delay=2.0, max_delay=30.0, timeout=300.0,
-                 on_wait=None):
+                 on_wait=None, lock_key=None, settle_s=60.0):
         self.host = host or os.environ.get("TIINY_HOST") or "127.0.0.1"
         self.key = key or os.environ.get("TIINY_KEY") or ""
         self.base = "http://%s:%d" % (self.host, int(port))
@@ -300,6 +400,10 @@ class Turnstile:
         self.base_delay = float(base_delay)
         self.max_delay = float(max_delay)
         self.timeout = float(timeout)
+        # After a read timeout we keep the device to ourselves until it answers again,
+        # for at most this long. It bounds the damage when a request is genuinely lost:
+        # without a cap a single dropped connection would wedge the device forever.
+        self.settle_s = float(settle_s)
         # on_wait(attempt, delay, why) — hook so an application can say "device busy"
         # in its own UI instead of going silent.
         self.on_wait = on_wait
@@ -309,9 +413,14 @@ class Turnstile:
         # 172177177) and would make two separate devices queue behind each other.
         # The port is deliberately NOT included: one Tiiny exposes several ports and
         # they all contend for the same NPU, so they must share a lock.
-        safe = "".join(c if c.isalnum() else "-" for c in self.host).strip("-") or "device"
-        self.key_id = "%s-%s" % (safe[:32], hashlib.sha1(self.host.encode()).hexdigest()[:8])
-        self._lock = _lock_for(os.path.join(LOCK_DIR, "turnstile-%s.lock" % self.key_id))
+        # Both halves must come from the RESOLVED identity. Deriving the readable half
+        # from the spelling instead put 'localhost' and '127.0.0.1' on different paths
+        # even though they hash the same, which quietly undid the whole fix.
+        ident = lock_key or _device_identity(self.host)
+        safe = "".join(c if c.isalnum() else "-" for c in ident).strip("-") or "device"
+        self.key_id = "%s-%s" % (safe[:32], hashlib.sha1(ident.encode()).hexdigest()[:8])
+        self._lock = _lock_for(os.path.join(_default_lock_dir(),
+                                            "turnstile-%s.lock" % self.key_id))
         self.budget = Budget(self)
 
     # -- plumbing ---------------------------------------------------------- #
@@ -334,6 +443,39 @@ class Turnstile:
             return blob if raw else {}
 
     @staticmethod
+    def _inband_error(payload):
+        """The device reports failure with HTTP 200 and an error object in the body.
+
+        Returns a message if this payload is one, else None. Without this, a declined
+        image came back as a bytes blob that happened to be JSON and was handed to the
+        caller as a PNG, and a declined chat quietly became an empty string. Both fail
+        far away from the cause.
+        """
+        obj = payload
+        if isinstance(obj, (bytes, bytearray)):
+            if obj[:1] != b"{":
+                return None                    # real binary, e.g. an actual PNG
+            try:
+                obj = json.loads(obj)
+            except ValueError:
+                return None
+        if not isinstance(obj, dict):
+            return None
+        err = obj.get("error")
+        if isinstance(err, dict):
+            return str(err.get("message") or err)[:200]
+        # A success body carries a payload key; an error body carries a nonzero code.
+        if any(k in obj for k in ("choices", "data", "results", "models")):
+            return None
+        code = obj.get("code")
+        try:
+            if code is not None and int(code) != 0:
+                return "code %s: %s" % (code, str(obj.get("message") or "")[:160])
+        except (TypeError, ValueError):
+            pass
+        return None
+
+    @staticmethod
     def _busy_reason(exc_or_payload):
         """Is this 'try again' or 'you are wrong'? Returns a reason string or None."""
         if isinstance(exc_or_payload, urllib.error.HTTPError):
@@ -348,6 +490,10 @@ class Turnstile:
             # the full backoff ladder.
             inner = getattr(exc_or_payload, "reason", exc_or_payload)
             if isinstance(inner, socket.gaierror):
+                return None
+            # Nothing is listening on that port. Six retries will not change that, and
+            # the wrong port is a far more common cause than a device mid-restart.
+            if isinstance(inner, OSError) and inner.errno == errno.ECONNREFUSED:
                 return None
             return "transport: %s" % str(exc_or_payload)[:60]
         if isinstance(exc_or_payload, dict):
@@ -364,22 +510,53 @@ class Turnstile:
                 return None
         return None
 
+    @staticmethod
+    def _is_timeout(exc):
+        """Did we give up on the socket, as opposed to the device answering us?
+
+        The distinction decides who owns the device during the backoff. A 150004 is the
+        device replying 'not now' — it is idle and the next caller should have it. A
+        read timeout means our request is very likely STILL RUNNING on the device, and
+        letting go would hand the lock to somebody who then collides with our own
+        in-flight inference.
+        """
+        inner = getattr(exc, "reason", None)
+        return isinstance(exc, (TimeoutError, socket.timeout)) or \
+            isinstance(inner, (TimeoutError, socket.timeout))
+
     def call(self, path, body=None, method="POST", raw=False, timeout=None):
-        """One device call, serialised and retried. This is the whole library."""
+        """One device call, serialised and retried. This is the whole library.
+
+        Note what happens after a read timeout. Giving up on the socket does not stop
+        the device, so our request is probably still running on it. From that moment we
+        stay 'stuck to' the lock: we do not let go between retries, and — the part that
+        is easy to get wrong — a subsequent 150004 no longer counts as evidence that the
+        device is free, because the thing keeping it busy is most likely our own orphaned
+        request. We hold until the device actually answers us or settle_s runs out.
+        """
         last = None
-        for attempt in range(1, self.tries + 1):
-            with self._lock.held(timeout=None):
+        settled = False        # we have already paid the settle wait once
+        held = False
+        attempt = 0
+        try:
+            while attempt < self.tries:
+                attempt += 1
+                settle_now = False
+                if not held:
+                    if not self._lock.acquire(timeout=None):
+                        raise DeviceBusy("could not take the device lock")
+                    held = True
+                free_after = True          # may we hand the device on after this attempt?
                 try:
                     out = self._request(path, body, method, timeout=timeout, raw=raw)
                     why = self._busy_reason(out)
                     if why is None:
-                        if raw and not isinstance(out, (bytes, bytearray)):
-                            # We promised bytes and got a JSON object that is not a busy
-                            # signal, so it is the device declining. Say so rather than
-                            # handing back a dict where a caller expects a PNG.
-                            raise DeviceError("device declined: %s" % str(out)[:200])
+                        bad = self._inband_error(out)
+                        if bad:
+                            raise DeviceError("device declined: %s" % bad)
                         return out
                     last = why
+                    free_after = True
                 except urllib.error.HTTPError as exc:
                     body_txt = b""
                     try:
@@ -390,22 +567,41 @@ class Turnstile:
                     if why is None:
                         raise DeviceError("HTTP %s: %s" % (exc.code, body_txt[:200].decode("utf-8", "replace")))
                     last = why
+                    free_after = True
                 except (urllib.error.URLError, TimeoutError, OSError) as exc:
                     why = self._busy_reason(exc)
                     if why is None:
                         raise
                     last = why
-            # released the lock before sleeping: whoever is actually using the device
-            # should get it, not us.
-            if attempt < self.tries:
-                delay = min(self.base_delay * (2 ** (attempt - 1)), self.max_delay)
-                delay += random.random() * (delay * 0.25)
+                    if self._is_timeout(exc) and not settled:
+                        # Our request is probably still running on the device. Keep the
+                        # lock and simply WAIT — do not re-issue, because a retry while
+                        # the first one is still going is itself the collision we are
+                        # trying to prevent. Once is enough; a second timeout after a
+                        # full settle means something is properly wrong.
+                        settled = True
+                        settle_now = True
+                        free_after = False
+                    else:
+                        free_after = True
+                if free_after and held:
+                    self._lock.release()
+                    held = False
+                if settle_now:
+                    delay = self.settle_s
+                else:
+                    delay = min(self.base_delay * (2 ** (attempt - 1)), self.max_delay)
+                    delay += random.random() * (delay * 0.25)
                 if self.on_wait:
                     try:
-                        self.on_wait(attempt, delay, last)
+                        self.on_wait(attempt, delay,
+                                     ("settling after timeout: " + str(last)) if settle_now else last)
                     except Exception:
                         pass
                 time.sleep(delay)
+        finally:
+            if held:
+                self._lock.release()
         raise DeviceBusy("device stayed busy across %d attempts (%s)" % (self.tries, last))
 
     def get(self, path, timeout=None):
