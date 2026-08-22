@@ -276,6 +276,23 @@ def main():
         el2 = time.time() - t0
         check("unresolvable host fails fast", el2 < 2.0, "%.2fs" % el2)
 
+    # (c) Two Turnstile objects in ONE process must not deadlock against each other.
+    #     flock is per open file description, so before the fix each object held its own
+    #     description and the second call blocked forever on the default timeout=None.
+    print("")
+    a = Turnstile(host=HOST, port=PORT, key="x")
+    b = Turnstile(host=HOST, port=PORT, key="x")
+    check("two instances share one lock", a._lock is b._lock)
+    a._lock.acquire()
+    try:
+        check("second instance is reentrant, not deadlocked",
+              b._lock.acquire(timeout=2.0) is True, "would hang forever if separate")
+        b._lock.release()
+    finally:
+        a._lock.release()
+    got = b.chat("fake/chat-35B", [{"role": "user", "content": "hi"}])
+    check("device still usable afterwards", got == "ok")
+
     srv.shutdown()
     print("\n%s  (%d checks failed)" % ("ALL PASS" if not failures else "FAILURES: " + ", ".join(failures),
                                         len(failures)))

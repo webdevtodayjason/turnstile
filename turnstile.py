@@ -94,6 +94,26 @@ class DeviceError(RuntimeError):
 # the lock
 # --------------------------------------------------------------------------- #
 
+_LOCKS = {}
+_LOCKS_GUARD = threading.Lock()
+
+
+def _lock_for(path):
+    """One lock object per lock file per process — and it has to be exactly one.
+
+    fcntl.flock is per open file description, not per process, so two lock objects in
+    one program hold two descriptions and genuinely block each other. An application
+    that builds a Turnstile in two different modules would then deadlock against
+    itself, forever, with the default of waiting indefinitely. Sharing the object makes
+    that case reentrant instead, which is what a caller means by it.
+    """
+    with _LOCKS_GUARD:
+        got = _LOCKS.get(path)
+        if got is None:
+            got = _LOCKS[path] = _CrossProcessLock(path)
+        return got
+
+
 class _CrossProcessLock:
     """An advisory file lock, reentrant within a process.
 
@@ -231,7 +251,7 @@ class Turnstile:
         # in its own UI instead of going silent.
         self.on_wait = on_wait
         self.key_id = "".join(c for c in self.host if c.isalnum()) or "device"
-        self._lock = _CrossProcessLock(os.path.join(LOCK_DIR, "turnstile-%s.lock" % self.key_id))
+        self._lock = _lock_for(os.path.join(LOCK_DIR, "turnstile-%s.lock" % self.key_id))
         self.budget = Budget(self)
 
     # -- plumbing ---------------------------------------------------------- #
