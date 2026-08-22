@@ -39,6 +39,12 @@ Copy `turnstile.py` next to your code. That is the install.
 Python 3.8+, standard library only. No pip, no daemon, no config file, no service to
 supervise.
 
+**POSIX only.** It is built on `fcntl.flock`, so Linux and macOS work and Windows does not
+— the import fails outright rather than pretending. And one honest exception to the
+crash-safety claim below: a `fork()` without `exec` passes the descriptor to the child, so
+the child is reset explicitly (`os.register_at_fork`) rather than being allowed to inherit
+a lock it does not own.
+
 ---
 
 ## Why a file lock
@@ -71,8 +77,17 @@ asynchronously, so a call issued right after start fails for roughly twelve seco
 the runtime reallocates. Both are retried with exponential backoff and jitter. Everything
 else is raised, because retrying a genuine mistake just makes you wrong more slowly.
 
-**Waiting politely.** The lock is released before each backoff sleep, so a retrying caller
-never sits on the device it is waiting for.
+**Waiting politely.** A retrying caller releases the lock before each backoff sleep, so it
+never sits on the device it is waiting for. Two deliberate exceptions:
+
+* **Inside `hold()`** the sleep happens still holding, because that is what `hold()` means.
+  The cost is real — one spurious 502 can park the device for the whole ladder, roughly a
+  minute at defaults. Keep holds short.
+* **After a read timeout** the lock is kept on purpose. Giving up on the socket does not
+  stop the device, so our request is probably still running; letting go there hands the
+  device to a peer who then collides with our own in-flight inference. Turnstile waits
+  once (`settle_s`, default 60s) rather than re-issuing, because retrying a request that
+  is still running *is* the collision.
 
 **The Ornith reasoning quirk.** The chat model puts its chain of thought in
 `reasoning_content`, and that **counts against `max_tokens`**. Ask for a small budget and
@@ -131,9 +146,20 @@ first:
 Running as one user on Linux, neither would ever have shown up. Set `TURNSTILE_DIR` to a
 shared path if your processes are in containers that do not share `/tmp`.
 
-The lock is per-device, so two Tiinys never block each other. The port is deliberately not
-part of the identity: one device exposes several ports that all contend for the same NPU,
-so they must share a lock.
+The lock is per-device, so two Tiinys never block each other. Identity is the *resolved*
+address, so `localhost` and `127.0.0.1` are correctly the same device — keying on the
+spelling meant two apps could each think they were serialised while neither ever blocked.
+Pass `lock_key="..."` to force two spellings together, or apart.
+
+The port is deliberately not part of the identity: one device exposes several ports that
+all contend for the same NPU, so they must share a lock. The known cost is that two
+*different* Tiinys reached through tunnels on `127.0.0.1:8800` and `:8801` will queue
+behind each other for no reason. Give them distinct `lock_key`s if that is your setup.
+
+Lock files live in a sticky `turnstile/` subdirectory and their timestamp is refreshed on
+every acquire, which keeps age-based tmp cleaners away from an actively used lock. That is
+a mitigation, not a guarantee: for a long-lived service, point `TURNSTILE_DIR` at a
+directory no cleaner touches.
 
 Constructor arguments cover the rest: `tries`, `base_delay`, `max_delay`, `timeout`, and
 `on_wait`, a callback so your UI can say "device busy" instead of going silent.

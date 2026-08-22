@@ -61,8 +61,10 @@ import os
 import random
 import socket
 import stat
+import sys
 import tempfile
 import threading
+import types
 import time
 import urllib.error
 import urllib.request
@@ -93,9 +95,21 @@ def _default_lock_dir():
     override = os.environ.get("TURNSTILE_DIR")
     if override:
         return override
-    if os.path.isdir("/tmp") and os.access("/tmp", os.W_OK):
-        return "/tmp"
-    return tempfile.gettempdir()
+    base = "/tmp" if os.path.isdir("/tmp") and os.access("/tmp", os.W_OK) \
+        else tempfile.gettempdir()
+    # A directory of our own, sticky like /tmp itself, so one user cannot delete or
+    # rename another's lock file and a hostile pre-create is contained.
+    den = os.path.join(base, "turnstile")
+    try:
+        os.mkdir(den, 0o1777)
+        os.chmod(den, 0o1777)                 # defeat the umask on the mode above
+    except FileExistsError:
+        pass
+    except OSError:
+        return base
+    if os.path.isdir(den) and os.access(den, os.W_OK):
+        return den
+    return base
 
 
 # One lock file per device, so two Tiinys never block each other. Set TURNSTILE_DIR when
@@ -168,6 +182,14 @@ def _open_shared(path):
                 "set TURNSTILE_DIR to a directory you share deliberately." % path)
         raise
     try:
+        # Age-based cleaners (systemd-tmpfiles, macOS periodic) delete /tmp files that
+        # look untouched. Refreshing the timestamp on every acquire keeps an actively
+        # used lock out of their way. It is a mitigation, not a guarantee — see the
+        # README note on TURNSTILE_DIR for long-lived services.
+        try:
+            os.utime(fd, None)
+        except OSError:
+            pass
         st = os.fstat(fd)
         if not stat.S_ISREG(st.st_mode):
             raise DeviceError("lock path %s is not a regular file" % path)
@@ -184,6 +206,15 @@ def _open_shared(path):
         os.close(fd)
         raise
     return fd
+
+
+def _same_file(path, fd):
+    """Does `path` still name the inode behind `fd`?"""
+    try:
+        a, b = os.stat(path), os.fstat(fd)
+    except OSError:
+        return False                          # the name is gone; ours is a stale inode
+    return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
 
 
 def _reset_after_fork():
@@ -214,13 +245,25 @@ if hasattr(os, "register_at_fork"):
     os.register_at_fork(after_in_child=_reset_after_fork)
 
 
-_LOCKS = {}
-_LOCKS_GUARD = threading.Lock()
-
+# The registry lives in sys.modules rather than in this module, because the shipping
+# model is "copy this file next to yours". Two copies of the file in one program would
+# otherwise mean two registries, two lock objects for one path, two open file
+# descriptions — and the self-deadlock this registry exists to prevent, permanently,
+# since call() waits forever by default.
+_REG_NAME = "_turnstile_lock_registry_v1"
+_registry = sys.modules.get(_REG_NAME)
+if _registry is None:
+    _registry = types.ModuleType(_REG_NAME)
+    _registry.locks = {}
+    _registry.guard = threading.Lock()
+    _registry.all_locks = weakref.WeakSet()
+    sys.modules[_REG_NAME] = _registry
+_LOCKS = _registry.locks
+_LOCKS_GUARD = _registry.guard
 # Every lock ever built, so the fork handler can reset all of them. Weak, so a lock that
 # goes out of scope is not kept alive by this. _LOCKS alone was not enough: a lock
 # constructed directly rather than through _lock_for would have been missed.
-_ALL_LOCKS = weakref.WeakSet()
+_ALL_LOCKS = _registry.all_locks
 
 
 def _lock_for(path):
@@ -275,6 +318,17 @@ class _CrossProcessLock:
             while True:
                 try:
                     fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    # The lock lives on the inode, not the name. A tmp cleaner can
+                    # delete the file while a long-lived holder still has it open; the
+                    # next process then creates a NEW inode at the same path, locks it
+                    # happily, and two processes both believe they hold the device. A
+                    # 24/7 service is exactly the profile this happens to, so confirm
+                    # the name still points at the thing we just locked.
+                    if not _same_file(self.path, fh):
+                        fcntl.flock(fh, fcntl.LOCK_UN)
+                        os.close(fh)
+                        fh = _open_shared(self.path)
+                        continue
                     self._fh = fh
                     self._owner = threading.get_ident()
                     self._depth = 1
@@ -361,6 +415,14 @@ class Budget:
 
     def note(self, model_id, units, owner):
         """Record that `owner` wants `model_id` resident. Advisory, for humans."""
+        # The whole read-modify-write needs to be exclusive. A unique temp name stops
+        # two writers corrupting one file, but it does not stop a lost update: both read
+        # the same book, both add their own entry, and the second rename discards the
+        # first. Measured before this: 6 concurrent writers, 1 surviving entry.
+        with _lock_for(self.path + ".lock").held(timeout=10):
+            return self._note_locked(model_id, units, owner)
+
+    def _note_locked(self, model_id, units, owner):
         try:
             with open(self.path) as fh:
                 book = json.load(fh)
@@ -679,7 +741,7 @@ class Turnstile:
         self.call("/api/v1/models/%s/start" % model_id.replace("/", "%2F"), {})
         if not wait:
             return True
-        deadline = time.time() + timeout
+        deadline = time.time() + min(float(timeout), float(os.environ.get("TURNSTILE_START_TIMEOUT") or timeout))
         while time.time() < deadline:
             for mid, _units, status in self.budget.resident():
                 if mid == model_id and status == "running":
@@ -698,16 +760,24 @@ class Turnstile:
         it alone. This is how a transient model (speech, OCR) coexists with somebody
         else's permanent set instead of quietly stealing their budget.
         """
-        mine = True
-        for mid, _u, status in self.budget.resident():
-            if mid == model_id and status == "running":
-                mine = False
-                break
-        if mine:
-            if units is not None and not self.budget.fits(units):
-                raise DeviceError("only %du free; %s needs %du" % (self.budget.free(), model_id, units))
-            self.start_model(model_id)
+        mine = False
         try:
+            # Decide and load under the lock. Read residency, check the budget and start
+            # the model as one indivisible step, or two processes both conclude the model
+            # is absent, both start it, and the first one to finish stops it under the
+            # other. `mine` is set BEFORE the call that can partially succeed, so a load
+            # that half-happens still gets cleaned up — that was the leak this context
+            # manager existed to prevent.
+            with self._lock.held(timeout=None):
+                resident = dict((mid, status) for mid, _u, status in self.budget.resident())
+                if resident.get(model_id) != "running":
+                    if units is not None and not self.budget.fits(units):
+                        raise DeviceError("only %du free; %s needs %du"
+                                          % (self.budget.free(), model_id, units))
+                    mine = True
+                    if not self.start_model(model_id):
+                        raise DeviceError("%s did not report running within the timeout"
+                                          % model_id)
             yield self
         finally:
             if mine:

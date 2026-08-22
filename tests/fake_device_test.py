@@ -16,6 +16,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import stat as _stat2
 import threading
 import time
@@ -42,6 +43,8 @@ class Device:
         self.served = 0
         self.fail_next = 0        # force N busy replies, to exercise the retry path
         self.decline_image = False
+        self.start_never_runs = False
+        self.stopped = []
 
     def enter(self):
         with self.lock:
@@ -82,15 +85,18 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"peak": DEV.peak, "collisions": DEV.collisions,
                                     "served": DEV.served})
         if self.path == "/api/v1/models/npu/status":
+            tts = "stopped" if DEV.start_never_runs else "stopped"
             return self._send(200, {"models": [
                 {"model_id": "fake/chat-35B", "npu_usage": 50, "status": "running"},
-                {"model_id": "fake/tts", "npu_usage": 7, "status": "stopped"}]})
+                {"model_id": "fake/tts", "npu_usage": 7, "status": tts}]})
         self._send(404, {"error": "nope"})
 
     def do_POST(self):
         n = int(self.headers.get("Content-Length") or 0)
         self.rfile.read(n)
         if self.path.startswith("/api/v1/models/"):
+            if self.path.endswith("/stop"):
+                DEV.stopped.append(self.path.split("/")[-2].replace("%2F", "/"))
             return self._send(200, {"ok": True})
         if self.path == "/v1/slow":
             # Occupies the device for longer than the client's own timeout, which is
@@ -198,6 +204,11 @@ def spawn(mode, procs, calls):
 # --------------------------------------------------------------------------- #
 
 def main():
+    # Private lock dir. Check (g) asserts a file mode, and on a shared box a file left
+    # by another user makes fchmod fail silently and the check flake for environmental
+    # reasons. Also proves TURNSTILE_DIR is actually honoured.
+    os.environ["TURNSTILE_DIR"] = tempfile.mkdtemp(prefix="turnstile-suite-")
+    os.environ["TURNSTILE_START_TIMEOUT"] = "2"   # keep the load-timeout check quick
     srv = ThreadingHTTPServer((HOST, PORT), Handler)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     time.sleep(0.2)
@@ -504,6 +515,50 @@ def main():
             os.remove(f)
         except OSError:
             pass
+
+    # (k) TURNSTILE_DIR is honoured, and honoured at construction rather than import.
+    check("lock lives under TURNSTILE_DIR",
+          t._lock.path.startswith(os.environ["TURNSTILE_DIR"]), t._lock.path)
+
+    # (l) borrowed() must hand the units back even when the load half-fails. start_model
+    #     used to sit outside the try, so a model that came up but never reported running
+    #     leaked exactly the units this context manager exists to return.
+    print("")
+    DEV.start_never_runs = True
+    try:
+        with t.borrowed("fake/tts", units=7):
+            pass
+        check("a model that never comes up is reported", False, "no error raised")
+    except DeviceError:
+        check("a model that never comes up is reported", True)
+    except Exception as exc:
+        check("a model that never comes up is reported", False, type(exc).__name__)
+    check("and its units are still handed back", "fake/tts" in DEV.stopped,
+          "stopped=%s" % DEV.stopped)
+    DEV.start_never_runs = False
+    DEV.stopped = []
+
+    # (m) note() is a read-modify-write, so concurrent writers must not lose entries.
+    print("")
+    b = t.budget
+    b.path = os.path.join(os.environ["TURNSTILE_DIR"], "ledger.json")
+    errs = []
+
+    def writer(i):
+        try:
+            b.note("model/%d" % i, i, "owner%d" % i)
+        except Exception as exc:
+            errs.append(repr(exc))
+
+    ths = [threading.Thread(target=writer, args=(i,)) for i in range(6)]
+    for th3 in ths:
+        th3.start()
+    for th3 in ths:
+        th3.join()
+    with open(b.path) as fh:
+        book = json.load(fh)
+    check("six concurrent ledger writes all survive", len(book) == 6 and not errs,
+          "%d of 6 kept, %d errors" % (len(book), len(errs)))
 
     srv.shutdown()
     print("\n%s  (%d checks failed)" % ("ALL PASS" if not failures else "FAILURES: " + ", ".join(failures),
