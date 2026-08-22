@@ -23,6 +23,7 @@ import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import turnstile as turnstile_mod
 from turnstile import Turnstile, DeviceBusy, DeviceError, _CrossProcessLock  # noqa: E402
 
 HOST, PORT = "127.0.0.1", 8899
@@ -361,6 +362,18 @@ def main():
     check("non-owner release is refused", guard["raised"] is True)
     check("device stayed locked through the attempt", guard["still_held"] is True,
           "would have been stolen mid-inference")
+
+    # (g) The lock file has to be usable by EVERY user sharing the device. A default
+    #     umask creates it 0644, so a second user gets PermissionError instead of a lock,
+    #     and the two applications never coordinate at all.
+    print("")
+    import stat as _stat
+    lp = t._lock.path
+    t._lock.acquire(); t._lock.release()
+    mode = _stat.S_IMODE(os.stat(lp).st_mode)
+    check("lock file is group/other writable", mode == 0o666, "mode %o" % mode)
+    check("lock dir is shared between users", not turnstile_mod.LOCK_DIR.startswith("/var/folders"),
+          turnstile_mod.LOCK_DIR)
 
     srv.shutdown()
     print("\n%s  (%d checks failed)" % ("ALL PASS" if not failures else "FAILURES: " + ", ".join(failures),

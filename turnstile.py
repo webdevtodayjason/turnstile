@@ -45,7 +45,7 @@ USAGE
 
     png = t.image("Tongyi-MAI/Z-Image-Turbo", "a lighthouse at dusk", seed=7)
 
-    with t.hold("rendering a page", seconds=120):   # several calls, no interleaving
+    with t.hold("rendering a page"):       # several calls, nothing interleaves
         a = t.chat(...)
         b = t.image(...)
 
@@ -60,6 +60,7 @@ import json
 import os
 import random
 import socket
+import stat
 import tempfile
 import threading
 import time
@@ -78,9 +79,31 @@ NPU_TOTAL = 100
 BUSY_DEVICE_CODE = 150004
 BUSY_HTTP = (502, 503, 504)
 
-# Where the cross-process lock lives. One file per device, so two Tiinys don't block
-# each other. Override with TURNSTILE_DIR if /tmp is not shared between your processes.
-LOCK_DIR = os.environ.get("TURNSTILE_DIR") or tempfile.gettempdir()
+def _default_lock_dir():
+    """A directory BOTH applications can see, which is the whole point.
+
+    Not tempfile.gettempdir(): on macOS that is per-user (/var/folders/...), so two
+    applications running as different users would take out two different lock files and
+    coordinate with nobody — silently, which is the worst way for a lock to fail. Real
+    deployments do run as different users; a service account and a login account sharing
+    one device is the normal case, not an exotic one. /tmp is shared on Linux and macOS
+    alike, so prefer it and fall back only if it is unusable.
+    """
+    override = os.environ.get("TURNSTILE_DIR")
+    if override:
+        return override
+    if os.path.isdir("/tmp") and os.access("/tmp", os.W_OK):
+        return "/tmp"
+    return tempfile.gettempdir()
+
+
+# One lock file per device, so two Tiinys never block each other. Set TURNSTILE_DIR when
+# your processes are in containers that do not share /tmp.
+LOCK_DIR = _default_lock_dir()
+
+# The lock file must be openable by every user sharing the device. Default umask would
+# create it 0644, so the second user to arrive gets PermissionError instead of a lock.
+LOCK_MODE = 0o666
 
 
 class DeviceBusy(RuntimeError):
@@ -94,6 +117,23 @@ class DeviceError(RuntimeError):
 # --------------------------------------------------------------------------- #
 # the lock
 # --------------------------------------------------------------------------- #
+
+def _open_shared(path):
+    """Open the lock file so any user sharing the device can lock it.
+
+    Returns a raw fd. O_CREAT respects the umask, which typically strips the group and
+    other write bits, so the mode is set explicitly afterwards. The chmod is best-effort:
+    if the file belongs to another user it will fail, and that is fine — it already has
+    the right mode or that user has already made their choice.
+    """
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, LOCK_MODE)
+    try:
+        if stat.S_IMODE(os.fstat(fd).st_mode) != LOCK_MODE:
+            os.fchmod(fd, LOCK_MODE)
+    except OSError:
+        pass
+    return fd
+
 
 _LOCKS = {}
 _LOCKS_GUARD = threading.Lock()
@@ -146,10 +186,10 @@ class _CrossProcessLock:
         # out, or one bad open() wedges this process for good.
         fh = None
         try:
-            fh = open(self.path, "a+")
+            fh = _open_shared(self.path)
             while True:
                 try:
-                    fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     self._fh = fh
                     self._depth = 1
                     self._owner = threading.get_ident()
@@ -164,7 +204,7 @@ class _CrossProcessLock:
         finally:
             if self._depth == 0:             # we are leaving without the lock
                 if fh is not None:
-                    fh.close()
+                    os.close(fh)
                 self._local.release()
 
     def release(self):
@@ -180,9 +220,9 @@ class _CrossProcessLock:
         if self._depth == 0:
             self._owner = None
             try:
-                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+                fcntl.flock(self._fh, fcntl.LOCK_UN)
             finally:
-                self._fh.close()
+                os.close(self._fh)
                 self._fh = None
         self._local.release()
 
