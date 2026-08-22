@@ -217,6 +217,21 @@ def _same_file(path, fd):
     return (a.st_dev, a.st_ino) == (b.st_dev, b.st_ino)
 
 
+def _alive(pid):
+    """Is that process still running? Signal 0 checks without disturbing it."""
+    if not pid or pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True                       # someone else's process, but it exists
+    except OSError:
+        return True                       # be conservative: do not erase a live waiter
+
+
 def _holder_path(lock_path):
     return lock_path                      # the lock file itself carries the record
 
@@ -267,14 +282,26 @@ def who(host=None, port=DEFAULT_PORT, lock_key=None, path=None):
             out["held_for_s"] = round(time.time() - float(rec["since"]), 2)
     now = time.time()
     try:
-        for fn in os.listdir(_waiters_dir(path)):
+        den = _waiters_dir(path)
+        for fn in os.listdir(den):
+            full = os.path.join(den, fn)
             try:
-                with open(os.path.join(_waiters_dir(path), fn)) as fh:
+                with open(full) as fh:
                     w = json.load(fh)
-                out["waiting"].append({"owner": w.get("owner"), "pid": w.get("pid"),
-                                       "for_s": round(now - float(w.get("since") or now), 2)})
-            except (OSError, ValueError):
+                pid = int(w.get("pid") or 0)
+            except (OSError, ValueError, TypeError):
                 continue
+            if not _alive(pid):
+                # A waiter killed with -9 never runs its finally, so its file would
+                # otherwise sit there forever and the queue would show a phantom. The
+                # reader sweeps it: whoever notices the corpse buries it.
+                try:
+                    os.unlink(full)
+                except OSError:
+                    pass
+                continue
+            out["waiting"].append({"owner": w.get("owner"), "pid": pid,
+                                   "for_s": round(now - float(w.get("since") or now), 2)})
     except OSError:
         pass
     out["waiting"].sort(key=lambda w: -(w["for_s"] or 0))

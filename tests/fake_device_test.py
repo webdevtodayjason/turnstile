@@ -588,6 +588,19 @@ def main():
           any(x["owner"] == "reverie" for x in w2["waiting"]), str(w2["waiting"]))
     check("who() clears once released", w3["held"] is False and w3["queue"] == 0)
 
+    # A waiter killed with -9 never runs its finally, so without a sweep its file sits
+    # in the queue directory forever and the dashboard shows a waiter that does not
+    # exist. Readers bury the corpse.
+    den = turnstile_mod._waiters_dir(holder._lock.path)
+    os.makedirs(den, exist_ok=True)
+    ghost = os.path.join(den, "999999-1.json")
+    with open(ghost, "w") as fh:
+        json.dump({"owner": "ghost", "pid": 999999, "since": time.time()}, fh)
+    w4 = turnstile_mod.who(host=HOST)
+    check("a dead waiter is not counted", w4["queue"] == 0,
+          "queue=%d %s" % (w4["queue"], w4["waiting"]))
+    check("and its file is swept", not os.path.exists(ghost))
+
     srv.shutdown()
     print("\n%s  (%d checks failed)" % ("ALL PASS" if not failures else "FAILURES: " + ", ".join(failures),
                                         len(failures)))
