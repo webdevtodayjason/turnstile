@@ -203,13 +203,28 @@ it, lists residency, makes one real inference, and then runs two concurrent proc
 while whatever else you have running keeps using the device — real contention from a
 workload that has never heard of the lock, which is the evidence that counts.
 
-> **Status: validated against the fake device, not yet against hardware.** The contention
-> contract the fake enforces, and the device behaviours documented above (`150004`,
-> the ~12s 502 window after `/start`, the `reasoning_content` budget quirk, 512×512-only
-> image generation) were all measured on a real Tiiny Pocket during the two applications
-> this pattern came from. The library reproducing them end-to-end on hardware is a run
-> that still needs doing — it needs a device API key. Do not take the table above as a
-> hardware result; it is a fake-device result on the machine named.
+### Measured on hardware
+
+Run on a **Tiiny AI Pocket** (firmware 0.1.33) over the USB link from an **Orange Pi 6 Plus**
+(Ubuntu 26.04), while a 24/7 news board was independently using the same device:
+
+```
+residency        Ornith-35B 50u + Z-Image-Turbo 32u + Embedding 1u + Reranker 2u  (85/100)
+one inference    deepreinforce-ai/Ornith-1.0-35B -> 'turnstile ok' in 8.6s
+two processes    6/6 calls completed, 0 refused, 48.3s
+the other app    items 1471, errors_24h 0, pending 0 — unaffected
+```
+
+The third line is the one that matters. Two processes competed for the device while a
+third application that has never heard of Turnstile hammered it independently, and not one
+call was refused. The NPU figures also agree with what the news board reports separately,
+so the budget accounting is right against hardware and not just against the fake.
+
+One honest note on how that run went: the first attempt failed with six consecutive `503`s.
+The library was blameless — the verification script had picked the first resident model
+over 20 units, which was the *image* model, and asked it to hold a conversation. The device
+was right to refuse. Fixed in `verify-on-device.sh`, and a good reminder that "biggest
+resident model" is not a synonym for "chat model".
 
 ---
 
