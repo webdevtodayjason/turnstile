@@ -684,6 +684,41 @@ def main():
     except OSError:
         pass
 
+    # ---- a lock directory nobody else can see ------------------------------------
+    # Both of these shipped silently in real deployments before anything caught them,
+    # so they get permanent cases rather than a one-off script.
+    import tempfile as _tf
+    _plat, _readlink = sys.platform, os.readlink
+
+    def _ns(same):
+        d = {"/proc/self/ns/mnt": "mnt:[1]", "/proc/1/ns/mnt": "mnt:[1]" if same else "mnt:[2]"}
+        # Lazily: os.readlink on a real /proc path must not be evaluated on a Mac.
+        os.readlink = lambda q: d[q] if q in d else _readlink(q)
+    try:
+        sys.platform = "darwin"
+        check("macOS per-user temp dir is refused",
+              "PER-USER" in (turnstile_mod.unshared_reason(_tf.gettempdir()) or ""))
+        check("a shared /tmp is not flagged on macOS",
+              turnstile_mod.unshared_reason("/tmp/turnstile") is None)
+        sys.platform = "linux"
+        _ns(False)
+        check("systemd PrivateTmp is refused",
+              "PrivateTmp" in (turnstile_mod.unshared_reason("/tmp/turnstile") or ""))
+        check("a shared path escapes a private namespace",
+              turnstile_mod.unshared_reason("/var/lib/x/locks") is None)
+        _ns(True)
+        check("same namespace raises no false alarm",
+              turnstile_mod.unshared_reason("/tmp/turnstile") is None)
+        os.readlink = _readlink
+        sys.platform = "darwin"
+        try:
+            turnstile_mod.check_shared(_tf.gettempdir())
+            check("check_shared refuses to start", False, "did not raise")
+        except RuntimeError as e:
+            check("check_shared refuses to start", "coordinate nothing" in str(e))
+    finally:
+        sys.platform, os.readlink = _plat, _readlink
+
     srv.shutdown()
     print("\n%s  (%d checks failed)" % ("ALL PASS" if not failures else "FAILURES: " + ", ".join(failures),
                                         len(failures)))
