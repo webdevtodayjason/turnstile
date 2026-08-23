@@ -116,6 +116,60 @@ def _default_lock_dir():
 # your processes are in containers that do not share /tmp.
 LOCK_DIR = _default_lock_dir()
 
+
+def unshared_reason(path=None):
+    """Why `path` is probably NOT the same directory the other processes see, or None.
+
+    A lock coordinates only the processes that open the SAME FILE, and nothing about
+    flock tells you whether they do. When the directory is private the lock does not
+    fail - it succeeds, instantly, for everyone, and the collisions it was installed to
+    prevent come back with no error to explain them. That is the worst way for a lock to
+    break, and it has now happened twice in real deployments:
+
+      * macOS gives each user their own /var/folders temp directory, so a service
+        account and a login account silently took out two different locks.
+      * systemd PrivateTmp=yes gives each unit its OWN mount namespace for /tmp, so two
+        units of the same application silently took out two different locks.
+
+    Both were found by reading unit files and namespace ids by hand, after the fact. This
+    is the check that would have caught either one in a second.
+    """
+    p = os.path.realpath(path or LOCK_DIR)
+    # realpath matters here: /var is a symlink to /private/var on macOS, so the per-user
+    # temp directory resolves to /private/var/folders/... and a naive prefix match on
+    # /var/folders/ misses the exact case this check exists for.
+    if sys.platform == "darwin" and p.startswith(("/var/folders/", "/private/var/folders/")):
+        return ("%s is macOS's PER-USER temp directory - processes running as a different "
+                "user get a different one and will not see this lock. Set TURNSTILE_DIR to "
+                "a path every participant can reach." % p)
+    try:
+        # A private mount namespace means our /tmp is not the /tmp anyone else has.
+        if os.readlink("/proc/self/ns/mnt") != os.readlink("/proc/1/ns/mnt") \
+                and (p == "/tmp" or p.startswith("/tmp/")):
+            return ("this process is in a private mount namespace (systemd PrivateTmp=yes, "
+                    "or a container), so %s is NOT the /tmp other processes see. Set "
+                    "TURNSTILE_DIR to a shared path - and on a hardened unit, grant it with "
+                    "ReadWritePaths=." % p)
+    except OSError:
+        pass                                  # no /proc: not Linux, nothing to check
+    return None
+
+
+def check_shared(path=None):
+    """Raise if the lock directory cannot coordinate anybody. Call it at startup.
+
+    Cheap enough to run on every boot, and it turns the silent failure above into a loud
+    one before any work depends on the lock being real.
+    """
+    why = unshared_reason(path)
+    if why:
+        raise RuntimeError("turnstile: this lock would coordinate nothing - " + why)
+    return True
+
+
+# Warn once, on the first real acquire, for callers who never call check_shared().
+_warned_unshared = False
+
 # The lock file must be openable by every user sharing the device. Default umask would
 # create it 0644, so the second user to arrive gets PermissionError instead of a lock.
 LOCK_MODE = 0o666
@@ -431,6 +485,18 @@ class _CrossProcessLock:
         if self._depth:                      # already ours; just nest
             self._depth += 1
             return True
+        # A lock in a directory nobody else can see is worse than no lock at all: it
+        # reports success while the device is being double-booked. Say so, once, loudly.
+        global _warned_unshared
+        if not _warned_unshared:
+            _warned_unshared = True
+            why = unshared_reason(os.path.dirname(self.path) or ".")
+            if why:
+                if os.environ.get("TURNSTILE_STRICT"):
+                    self._local.release()
+                    raise RuntimeError("turnstile: this lock would coordinate nothing - " + why)
+                sys.stderr.write("turnstile: WARNING - this lock may coordinate nothing: %s\n"
+                                 % why)
         # Everything from here until _depth is set must hand the RLock back on the way
         # out, or one bad open() wedges this process for good.
         fh = None
