@@ -117,6 +117,18 @@ def _default_lock_dir():
 LOCK_DIR = _default_lock_dir()
 
 
+def _in_container():
+    """Best-effort: are we inside a container? Cheap, and only ever used to explain."""
+    if os.path.exists("/.dockerenv") or os.path.exists("/run/.containerenv"):
+        return True
+    try:
+        with open("/proc/1/cgroup", "rb") as fh:
+            blob = fh.read(4096)
+    except OSError:
+        return False
+    return any(m in blob for m in (b"docker", b"containerd", b"lxc", b"kubepods"))
+
+
 def unshared_reason(path=None):
     """Why `path` is probably NOT the same directory the other processes see, or None.
 
@@ -143,16 +155,23 @@ def unshared_reason(path=None):
                 "user get a different one and will not see this lock. Set TURNSTILE_DIR to "
                 "a path every participant can reach." % p)
     try:
-        # A private mount namespace means our /tmp is not the /tmp anyone else has.
         # Resolve /tmp rather than matching the literal string: it is a symlink to
         # /private/tmp on macOS, and realpath() above has already followed it.
         tmp = os.path.realpath("/tmp")
-        if os.readlink("/proc/self/ns/mnt") != os.readlink("/proc/1/ns/mnt") \
-                and (p == tmp or p.startswith(tmp + os.sep)):
-            return ("this process is in a private mount namespace (systemd PrivateTmp=yes, "
-                    "or a container), so %s is NOT the /tmp other processes see. Set "
-                    "TURNSTILE_DIR to a shared path - and on a hardened unit, grant it with "
-                    "ReadWritePaths=." % p)
+        if not (p == tmp or p.startswith(tmp + os.sep)):
+            return None                       # not the default /tmp: not our business
+        # A private mount namespace means our /tmp is not the /tmp anyone else has.
+        if os.readlink("/proc/self/ns/mnt") != os.readlink("/proc/1/ns/mnt"):
+            return ("this process is in a private mount namespace (systemd "
+                    "PrivateTmp=yes), so %s is NOT the /tmp other units see. Set "
+                    "TURNSTILE_DIR to a shared path - and on a hardened unit, grant it "
+                    "with ReadWritePaths=." % p)
+        # A container's entrypoint IS pid 1 of its own namespace, so the check above
+        # matches and tells us nothing. /tmp is still private to the container.
+        if _in_container():
+            return ("this process is in a container, so %s is private to it and other "
+                    "containers cannot see this lock. Set TURNSTILE_DIR to a path shared "
+                    "between them (a bind mount or a shared volume)." % p)
     except OSError:
         pass                                  # no /proc: not Linux, nothing to check
     return None
@@ -170,8 +189,30 @@ def check_shared(path=None):
     return True
 
 
-# Warn once, on the first real acquire, for callers who never call check_shared().
-_warned_unshared = False
+# The automatic check, evaluated once and then remembered: the answer cannot change
+# while the process runs.
+_auto_lock = threading.Lock()
+_auto_reason = "unset"                        # sentinel: not computed yet
+_auto_warned = False
+
+
+def _auto_unshared(dirname):
+    """The reason to complain about `dirname` automatically, or None.
+
+    Deliberately silent when TURNSTILE_DIR was set explicitly. Someone who set it has
+    thought about which directory their processes share; someone on the default has not,
+    and is exactly who this protects. That single condition also removes the false alarms
+    worth caring about - a hardened unit bind-mounting a shared directory under /tmp is
+    doing precisely the right thing and must not be told otherwise.
+    """
+    global _auto_reason
+    if _auto_reason != "unset":
+        return _auto_reason
+    with _auto_lock:
+        if _auto_reason == "unset":           # recheck: another thread may have won
+            _auto_reason = None if os.environ.get("TURNSTILE_DIR") \
+                else unshared_reason(dirname)
+    return _auto_reason
 
 # The lock file must be openable by every user sharing the device. Default umask would
 # create it 0644, so the second user to arrive gets PermissionError instead of a lock.
@@ -321,8 +362,12 @@ def who(host=None, port=DEFAULT_PORT, lock_key=None, path=None):
         key_id = "%s-%s" % (safe[:32], hashlib.sha1(ident.encode()).hexdigest()[:8])
         path = os.path.join(_default_lock_dir(), "turnstile-%s.lock" % key_id)
 
-    out = {"held": False, "owner": None, "pid": None, "why": None,
-           "held_for_s": None, "waiting": [], "lock": path}
+    # A dashboard is where someone actually looks. stderr on a systemd unit goes to a
+    # journal nobody tails until something is already broken, which is exactly how a
+    # silently unshared lock stays silent. Surface it here so the board can render it.
+    out = {"held": False, "owner": None, "pid": None, "why": None, "held_for_s": None,
+           "waiting": [], "lock": path,
+           "lock_warning": _auto_unshared(os.path.dirname(path) or ".")}
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
     except OSError:
@@ -488,23 +533,28 @@ class _CrossProcessLock:
         if self._depth:                      # already ours; just nest
             self._depth += 1
             return True
-        # A lock in a directory nobody else can see is worse than no lock at all: it
-        # reports success while the device is being double-booked. Say so, once, loudly.
-        global _warned_unshared
-        if not _warned_unshared:
-            _warned_unshared = True
-            why = unshared_reason(os.path.dirname(self.path) or ".")
-            if why:
-                if os.environ.get("TURNSTILE_STRICT"):
-                    self._local.release()
-                    raise RuntimeError("turnstile: this lock would coordinate nothing - " + why)
-                sys.stderr.write("turnstile: WARNING - this lock may coordinate nothing: %s\n"
-                                 % why)
         # Everything from here until _depth is set must hand the RLock back on the way
-        # out, or one bad open() wedges this process for good.
+        # out, or one bad open() wedges this process for good. That includes the check
+        # below: it goes INSIDE the try, so a raise from it cannot strand the RLock and
+        # leave this object reading _depth=0, _fh=None while every other thread hangs.
         fh = None
         queued = None
         try:
+            # A lock in a directory nobody else can see is worse than no lock at all: it
+            # reports success while the device is being double-booked.
+            why = _auto_unshared(os.path.dirname(self.path) or ".")
+            if why:
+                # Strict is evaluated EVERY time, not once. It is the one path that has
+                # to fail closed, and a caller that catches the error and retries must
+                # not be handed a working-looking lock on the second attempt.
+                if os.environ.get("TURNSTILE_STRICT"):
+                    raise RuntimeError(
+                        "turnstile: this lock would coordinate nothing - " + why)
+                global _auto_warned
+                if not _auto_warned:
+                    _auto_warned = True
+                    sys.stderr.write(
+                        "turnstile: WARNING - this lock may coordinate nothing: %s\n" % why)
             fh = _open_shared(self.path)
             while True:
                 try:

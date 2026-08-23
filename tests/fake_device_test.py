@@ -689,6 +689,7 @@ def main():
     # so they get permanent cases rather than a one-off script.
     import tempfile as _tf
     _plat, _readlink = sys.platform, os.readlink
+    _orig_reason = turnstile_mod.unshared_reason
 
     def _ns(same):
         d = {"/proc/self/ns/mnt": "mnt:[1]", "/proc/1/ns/mnt": "mnt:[1]" if same else "mnt:[2]"}
@@ -716,6 +717,57 @@ def main():
             check("check_shared refuses to start", False, "did not raise")
         except RuntimeError as e:
             check("check_shared refuses to start", "coordinate nothing" in str(e))
+
+        # ---- strict mode must fail CLOSED, every time -----------------------------
+        # The first cut set the once-only warning flag before testing strict, so strict
+        # raised once and then handed out a working-looking lock forever. Anything that
+        # caught the error and retried got a silently unshared lock.
+        import tempfile as _t2
+        bad = os.path.join(_tf.mkdtemp(), "unshared")
+        os.makedirs(bad, exist_ok=True)
+        lk = _CrossProcessLock(os.path.join(bad, "x.lock"))
+        _env = os.environ.get("TURNSTILE_STRICT")
+        _dir = os.environ.pop("TURNSTILE_DIR", None)      # the gate: default dir only
+        os.environ["TURNSTILE_STRICT"] = "1"
+        turnstile_mod._auto_reason = "unset"
+        turnstile_mod.unshared_reason = lambda *a, **k: "test: pretend it is unshared"
+        try:
+            raised = 0
+            for _ in range(3):
+                try:
+                    lk.acquire(timeout=1)
+                except RuntimeError:
+                    raised += 1
+                else:
+                    lk.release()
+            check("strict raises on EVERY acquire, not just the first", raised == 3,
+                  "raised %d of 3" % raised)
+            # ...and a raise there must not stand the RLock up on its own.
+            free = lk._local.acquire(blocking=False)
+            if free:
+                lk._local.release()
+            check("a refused acquire does not strand the RLock", free)
+        finally:
+            turnstile_mod.unshared_reason = _orig_reason
+            turnstile_mod._auto_reason = "unset"
+            os.environ.pop("TURNSTILE_STRICT", None)
+            if _env is not None:
+                os.environ["TURNSTILE_STRICT"] = _env
+            if _dir is not None:
+                os.environ["TURNSTILE_DIR"] = _dir
+
+        # ---- an explicit TURNSTILE_DIR silences the automatic check ---------------
+        # Someone who set it has thought about which directory their processes share.
+        # This is also what stops a hardened unit bind-mounting a shared dir under /tmp
+        # from being told it is wrong.
+        turnstile_mod._auto_reason = "unset"
+        os.environ["TURNSTILE_DIR"] = "/some/deliberate/path"
+        try:
+            check("an explicit TURNSTILE_DIR silences the auto-check",
+                  turnstile_mod._auto_unshared(_tf.gettempdir()) is None)
+        finally:
+            os.environ.pop("TURNSTILE_DIR", None)
+            turnstile_mod._auto_reason = "unset"
     finally:
         sys.platform, os.readlink = _plat, _readlink
 
