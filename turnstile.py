@@ -144,8 +144,11 @@ def unshared_reason(path=None):
                 "a path every participant can reach." % p)
     try:
         # A private mount namespace means our /tmp is not the /tmp anyone else has.
+        # Resolve /tmp rather than matching the literal string: it is a symlink to
+        # /private/tmp on macOS, and realpath() above has already followed it.
+        tmp = os.path.realpath("/tmp")
         if os.readlink("/proc/self/ns/mnt") != os.readlink("/proc/1/ns/mnt") \
-                and (p == "/tmp" or p.startswith("/tmp/")):
+                and (p == tmp or p.startswith(tmp + os.sep)):
             return ("this process is in a private mount namespace (systemd PrivateTmp=yes, "
                     "or a container), so %s is NOT the /tmp other processes see. Set "
                     "TURNSTILE_DIR to a shared path - and on a hardened unit, grant it with "
