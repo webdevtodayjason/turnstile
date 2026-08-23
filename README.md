@@ -138,6 +138,7 @@ with t.borrowed("Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice", units=7):
 | `TIINY_HOST` | `127.0.0.1` | device address |
 | `TIINY_KEY` | — | device API key |
 | `TURNSTILE_DIR` | `/tmp` | where the lock file lives |
+| `TURNSTILE_STRICT` | unset | refuse to run when the lock cannot coordinate anyone |
 
 Two processes only coordinate if they lock the **same file**, so the default is `/tmp` and
 the lock file is created mode `0666`. Both of those are deliberate, and both were bugs
@@ -150,8 +151,40 @@ first:
 * The umask creates files `0644`, so the second user to arrive got `PermissionError`
   instead of a lock.
 
-Running as one user on Linux, neither would ever have shown up. Set `TURNSTILE_DIR` to a
-shared path if your processes are in containers that do not share `/tmp`.
+* **systemd `PrivateTmp=yes` gives each unit its own `/tmp`.** This one bit us in
+  production. Two units of the *same* application, hardened the ordinary way, each got a
+  private mount namespace — measured `mnt:[4026533314]` and `mnt:[4026533312]` against the
+  host's `mnt:[4026531832]`. Two lock files, in two filesystems, coordinating nobody.
+
+Running as one user on Linux, none of these would ever have shown up.
+
+### Does your lock actually coordinate anyone?
+
+The bugs above share a shape: **the lock does not fail, it succeeds** — instantly, for
+everyone — and the collisions come back with no error to explain them. Three environments
+have now defeated it silently, so the library checks:
+
+```python
+turnstile.check_shared()          # raises if the directory cannot coordinate anyone
+turnstile.unshared_reason()       # the reason as a string, or None
+```
+
+`check_shared()` is meant for startup. If you call neither, the first `acquire()` writes
+one warning to stderr; `TURNSTILE_STRICT=1` makes that an error instead. `who()` also
+returns `lock_warning`, so a dashboard can show it — a correct warning in a log nobody
+tails is how this class of bug stays quiet in the first place.
+
+It detects the macOS per-user temp directory, a private mount namespace, and containers
+(checked separately, because a container's entrypoint *is* PID 1 of its own namespace, so
+the namespace test is blind to it). It stays silent when you set `TURNSTILE_DIR` yourself,
+on the grounds that you have already thought about the question — otherwise it would scold
+the operator who bind-mounts a genuinely shared directory under `/tmp`, which is exactly
+the right thing to do.
+
+**It cannot prove a directory *is* shared.** Nothing observable from inside one process
+can. It only spots known ways it is not. If you want real evidence, have each participant
+drop a marker file at startup and log which peers it can see: two processes seeing each
+other is proof, and a permanent "peers: none" is the symptom.
 
 The lock is per-device, so two Tiinys never block each other. Identity is the *resolved*
 address, so `localhost` and `127.0.0.1` are correctly the same device — keying on the
@@ -221,6 +254,38 @@ one inference    deepreinforce-ai/Ornith-1.0-35B -> 'turnstile ok' in 8.6s
 two processes    6/6 calls completed, 0 refused, 48.3s
 the other app    items 1471, errors_24h 0, pending 0 — unaffected
 ```
+
+### And then in production
+
+The 24/7 news board above was later moved onto Turnstile itself, replacing an advisory
+scheme of timestamps in SQLite. It is two systemd units and roughly ten concurrent
+device-calling threads — six daemon threads on independent timers, plus a threading HTTP
+server that spawns a thread per request. Timing the device calls themselves, from two
+separate processes:
+
+```
+bravo   device call  0.00s -> 0.96s   ok
+alpha   device call  1.40s -> 2.39s   ok
+
+overlap 0.00s  ·  max queue depth 1  ·  errors 0
+```
+
+Then, over 100 seconds of ordinary unmodified traffic:
+
+```
+polled 333 times, device held in 54 of them (16%)
+  pipeline   image #961        held 15s
+  pipeline   completions       held  1s
+```
+
+Two things worth taking from that. The lock is engaged by real work rather than only by a
+test harness — and `who()` was polled three times a second throughout without delaying a
+single inference, because reading the holder record never takes the lock.
+
+One measurement in that run was wrong before it was right: the first version timed
+*process lifetimes*, which include interpreter startup and imports, and reported a "1.30s
+overlap" that was entirely instrumentation. If you reproduce this, time the call, not the
+program.
 
 The third line is the one that matters. Two processes competed for the device while a
 third application that has never heard of Turnstile hammered it independently, and not one
